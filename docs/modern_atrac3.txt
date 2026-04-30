@@ -1,0 +1,1820 @@
+Backward-Compatible Modern ATRAC3 / ATRAC3plus Encoder Design Notes
+
+0. Scope
+
+This document describes encoder-side improvements for a modern ATRAC3 / ATRAC3plus encoder that remains playable on existing physical MiniDisc / Hi-MD hardware.
+
+The compatibility target is strict:
+
+Modern analysis is allowed.
+Modern search is allowed.
+Modern perceptual scoring is allowed.
+Modern machine-learning assistance is allowed.
+But the emitted bitstream must remain ordinary ATRAC3 or ATRAC3plus.
+
+That means the following are out of scope for this document:
+
+new decoder tools
+new side data
+new Opus/CELT PVQ syntax
+new AAC/USAC syntax
+new residual enhancement layers
+new GHA fields
+new postfilters
+new bitstream profiles
+
+ATRAC3 already has a fixed legacy pipeline: band splitting, gain control, MDCT, tonal/non-tonal separation, quantization, and synthesis through inverse transform and band-synthesis filtering. Sony’s ATRAC3 overview describes this directly: the input is split into four bands, gain control is applied, MDCT converts the result to frequency-domain signals, tonal and non-tonal components are separated, and the decoder reconstructs through IMDCT, gain compensation, and band synthesis.  ￼
+
+For Hi-MD, the most interesting target is ATRAC3plus, because Hi-MD hardware uses ATRAC3plus for Hi-SP / Hi-LP operation, and public ATRAC3plus decoder structures expose richer tools: sine-wave tone parameters, tone envelopes, tone sharing, gain/window state, quantization units, coded subbands, and noise-related fields.  ￼
+
+⸻
+
+1. Compatibility model
+
+1.1 Strict hardware-compatible mode
+
+The encoder must generate a stream that a legacy decoder can parse and decode without knowing anything about the modern encoder.
+
+PCM input
+  → modern analysis
+  → modern candidate generation
+  → modern closed-loop optimization
+  → legal ATRAC3 / ATRAC3plus bitstream
+  → existing MD / Hi-MD decoder
+  → PCM output
+
+The legacy decoder is unchanged.
+
+1.2 What can be changed
+
+The encoder can change which legal parameters it chooses, such as:
+
+scale-factor indexes
+word lengths / quantization precision
+coded subband count
+coded quantization units
+code-table choices
+tonal component selection
+ATRAC3plus GHA/sine-wave tone parameters
+gain-control data
+window-shape choices, where legal
+joint-stereo decisions
+tone-sharing decisions
+high-band omission decisions
+noise/power-compensation choices, where legal
+
+1.3 What cannot be changed
+
+The encoder must not emit anything the old decoder does not already understand:
+
+no CELT PVQ vectors
+no Opus range coding
+no AAC TNS syntax
+no AAC PNS flags
+no USAC arithmetic-coded spectrum
+no USAC ACELP/TCX mode
+no SBR/eSBR layer
+no parametric-stereo side data
+no neural codec tokens
+no new ATRAC3plus tone fields
+no extra residual layer
+
+ATRAC RTP transport has a base/enhancement-layer concept, where a base layer can produce lossy audio and enhancement data can refine it, but that is not the same as being playable by a physical MD/Hi-MD device. For this document, even enhancement-layer ideas are excluded unless the legacy hardware already accepts them.  ￼
+
+⸻
+
+2. Existing ATRAC tools to exploit
+
+2.1 ATRAC3
+
+ATRAC3 gives the encoder these major degrees of freedom:
+
+four-band QMF-derived analysis
+gain adjustment around attacks
+MDCT spectral coefficients
+tonal vs non-tonal component coding
+scale factors / quantization decisions
+joint stereo decisions
+coded / uncoded spectral regions
+
+The four equal-band structure is important. Sony describes ATRAC3 as splitting audio into four equal bands and producing 256 frequency-domain values per band, for 1024 total values.  ￼
+
+2.2 ATRAC3plus
+
+ATRAC3plus gives the encoder a richer target. Public decoder-side structures show:
+
+PQF / pseudo-QMF subband synthesis
+IMDCT window-shape state
+gain-control information
+quantization unit scale-factor indexes
+quantization unit word lengths
+coded subband / quant-unit counts
+GHA/sine-wave groups
+single sine-wave frequency, amplitude, and phase indexes
+tone envelopes with start/stop points
+tone sharing and phase inversion flags
+noise-level / noise-table fields
+
+The most important fact for a modern encoder is that ATRAC3plus already has native sine-wave tone syntax. FFmpeg’s public ATRAC3plus headers describe groups of sine waves, amplitude envelopes, single-wave frequency indexes, amplitude scale factors, amplitude indexes, and phase indexes.  ￼
+
+So for Hi-MD-compatible work, the correct strategy is not “add modern sinusoidal coding.” It is:
+
+use modern sinusoidal analysis
+→ quantize the result into existing ATRAC3plus GHA/tone syntax
+
+⸻
+
+3. Overall proposed encoder architecture
+
+A modern backward-compatible encoder should be built as a search-and-score system, not as a simple feed-forward psychoacoustic model.
+
+Input PCM
+  ↓
+pre-analysis
+  - level / DC / clipping checks
+  - multi-resolution time-frequency analysis
+  - critical-band energy model
+  - transient detection
+  - tonality / noise classification
+  - stereo image analysis
+  - speech/music/percussion classification
+  ↓
+candidate generation
+  - GHA tone candidates
+  - residual spectrum candidates
+  - gain/window candidates
+  - stereo candidates
+  - high-band policy candidates
+  - allocation candidates
+  ↓
+legacy ATRAC candidate encoder
+  - emits legal ATRAC3 / ATRAC3plus frames
+  ↓
+local legacy decoder
+  - decodes the exact emitted candidate
+  ↓
+perceptual scorer
+  - band-energy error
+  - tonal error
+  - pre-echo risk
+  - stereo image error
+  - temporal pumping
+  - birdie / warble risk
+  ↓
+best legal frame selected
+  ↓
+output bitstream
+
+This is the central idea: the encoder should optimize the sound of the actual decoded output, not just the mathematical closeness of internal coefficients.
+
+A useful objective function is:
+
+minimize over legal ATRAC parameter sets P:
+    D(P) + λ · R(P)
+subject to:
+    R(P) ≤ target frame bits
+    P is valid legacy ATRAC syntax
+    P passes hardware-conformance tests
+
+Where D(P) is a perceptual distortion score, not plain sample-domain mean squared error.
+
+A practical distortion function might look like:
+
+D =
+  w_energy   · band_energy_error
++ w_tone     · tonal_peak_error
++ w_pre_echo · pre_echo_error
++ w_stereo   · stereo_image_error
++ w_noise    · noise_texture_error
++ w_pump     · temporal_pumping_error
++ w_artifact · artifact_detector_penalty
+
+⸻
+
+4. Idea catalog
+
+4.1 Closed-loop encode/decode optimization
+
+Concept
+
+A period-correct encoder often decides parameters once, emits the frame, and trusts the model. A modern encoder should try multiple legal encodings, locally decode them, and score the result.
+
+for each frame:
+    generate legal candidates
+    encode candidate
+    decode candidate
+    compare decoded audio to source
+    select best candidate
+
+Why it helps
+
+Lossy codecs fail through interactions:
+
+tone choice affects residual bits
+residual bits affect scale factors
+scale factors affect band energy
+band energy affects stereo masking
+stereo choice affects side-channel audibility
+gain-control choice affects pre-echo
+
+A greedy encoder can make locally reasonable decisions that combine poorly. Closed-loop scoring lets the encoder measure the actual combined result.
+
+ATRAC-compatible mapping
+
+This does not change the bitstream. The old decoder receives only the final chosen legal frame.
+
+Implementation notes
+
+A practical implementation should support several search depths:
+
+fast mode:
+  one-pass psychoacoustic decisions
+normal mode:
+  small candidate set + local decode
+high-quality/offline mode:
+  beam search over tone set, allocation, stereo, and gain/window decisions
+archival/offline mode:
+  multi-frame lookahead + expensive perceptual scoring
+
+For MiniDisc/Hi-MD transfer, high encoder complexity is usually acceptable. The physical player still decodes cheaply.
+
+⸻
+
+4.2 CELT-style band-energy preservation, mapped to ATRAC scale factors
+
+Concept
+
+CELT explicitly separates band energy from spectral shape: it computes energy for each critical-band-like band, normalizes each band, codes energy, then codes the remaining shape. The Opus/CELT specification describes MDCT bands designed around critical bands, per-band energy computation, normalization by unquantized energy, and log-energy quantization.  ￼
+
+ATRAC3/ATRAC3plus cannot adopt CELT’s PVQ shape coding without breaking compatibility. But the encoder-side lesson is still valuable:
+
+preserve the decoded spectral envelope first
+then spend remaining freedom on coefficient detail
+
+Theory
+
+Human listeners are often more sensitive to wrong energy distribution than to small coefficient-level errors. A decoded band that has the wrong energy can sound:
+
+dull
+harsh
+hollow
+swishy
+muffled
+phasey
+unstable
+
+Even if the sample-domain error is numerically small.
+
+Define source and decoded band energies:
+
+E_src(b, t) = log2(ε + Σ_k∈band(b) |X_src(k, t)|²)
+E_dec(b, t) = log2(ε + Σ_k∈band(b) |X_dec(k, t)|²)
+ΔE(b, t) = E_dec(b, t) - E_src(b, t)
+
+Then penalize energy error:
+
+D_energy = Σ_b,t W_b,t · ρ(ΔE(b, t))
+
+Where ρ can be squared error, absolute error, or an asymmetric penalty that punishes under-energy more strongly in exposed bands.
+
+ATRAC-compatible mapping
+
+Use the band-energy model to choose:
+
+ATRAC3 scale factors
+ATRAC3plus quantization-unit scale-factor indexes
+word lengths
+coded quantization units
+coded subband count
+GHA tone vs residual allocation
+high-band omission
+joint-stereo thresholds
+
+Practical heuristic
+
+For each frame:
+
+1. Compute critical-band-like source energies.
+2. Encode/decode candidate ATRAC frame.
+3. Compute decoded energies using the same band layout.
+4. Penalize large log-energy errors.
+5. Adjust scale factors and bit allocation.
+6. Repeat until the bit budget is met.
+
+Special handling
+
+Use asymmetric penalties:
+
+under-coding vocal formants:
+  high penalty
+under-coding bass fundamentals:
+  high penalty
+over-coding masked high-frequency noise:
+  low penalty
+over-coding cymbal wash:
+  medium penalty, because harshness may appear
+under-coding room/reverb air:
+  medium-high penalty, especially in stereo
+
+⸻
+
+4.3 Rate-distortion allocation over existing ATRAC knobs
+
+Concept
+
+CELT’s encoder uses explicit allocation mechanisms such as band boost, allocation trim, and band skipping; the Opus spec describes band boost for locally prominent energy, allocation trim for low/high-frequency balance, and band skipping with hysteresis.  ￼
+
+A modern ATRAC encoder cannot use CELT’s bit allocation syntax, but it can use the same decision philosophy.
+
+ATRAC-compatible mapping
+
+Search over legal choices:
+
+coded subbands
+coded quantization units
+scale-factor indexes
+word lengths
+code tables
+tonal component count
+GHA tone set
+gain-control points
+window shapes
+joint-stereo mode
+tone sharing
+high-frequency cutoff / omission
+noise/power-compensation choices
+
+Theoretical model
+
+Use Lagrangian optimization:
+
+J = D + λR
+
+Where:
+
+D = perceptual distortion
+R = frame bit cost
+λ = rate-control pressure
+
+The encoder should not ask “which setting gives the lowest error?” It should ask:
+
+which setting gives the greatest perceptual improvement per bit?
+
+Practical algorithm
+
+initialize legal baseline allocation
+while bits remain:
+    for each possible local improvement:
+        estimate ΔD / ΔR
+    apply the improvement with best perceptual return
+    update dependent estimates
+if frame exceeds bit budget:
+    remove least valuable decisions until legal
+
+A high-quality encoder should then locally decode and verify the resulting candidate.
+
+⸻
+
+4.4 GHA / sinusoidal modeling for ATRAC3plus
+
+Concept
+
+ATRAC3plus already has sine-wave tone machinery. A modern encoder should use a much better GHA-style analysis to select and quantize those tones.
+
+MPEG-4 HILN is a useful conceptual reference: it decomposes audio into harmonic lines, individual lines, and noise, using perception models to select the most relevant components. The HILN overview explicitly describes harmonic components, sinusoidal components, noise components, parameter estimation, and selection of relevant components.  ￼
+
+ATRAC3plus is not HILN, but the idea maps naturally:
+
+HILN-like analysis:
+  harmonic partials
+  individual tones
+  noise-like texture
+  residual waveform
+ATRAC3plus-compatible output:
+  existing GHA/sine-wave tone fields
+  existing residual spectrum coding
+  existing noise/power compensation
+
+Signal model
+
+Represent a frame or analysis region as:
+
+x[n] ≈ Σ_i a_i[n] cos(2π f_i n / Fs + φ_i) + r[n]
+
+Where:
+
+a_i[n] = short-term amplitude envelope
+f_i    = frequency of tonal partial
+φ_i    = phase
+r[n]   = residual, including noise-like and non-tonal material
+
+The encoder then decides which sinusoids are worth coding as ATRAC3plus tones.
+
+Candidate extraction
+
+Use multiple detectors:
+
+spectral peak picking
+harmonic stack detection
+phase-coherence tests
+spectral flatness
+spectral crest factor
+peak-to-neighbor energy
+inter-frame frequency stability
+amplitude-envelope stability
+pitch/fundamental estimation
+
+Partial tracking
+
+Frame-by-frame peak picking is not enough. A good encoder needs partial tracking:
+
+frame t-1 peak at 440.1 Hz
+frame t   peak at 441.0 Hz
+frame t+1 peak at 440.4 Hz
+→ one continuing partial, not three unrelated tones
+
+Tracking reduces:
+
+birdies
+tone flicker
+frequency jumping
+phase discontinuity
+metallic ringing
+unstable stereo images
+
+Use Viterbi-style or Kalman-style tracking:
+
+state:
+  frequency
+  amplitude
+  phase
+  harmonic group id
+  stereo relation
+  previous ATRAC quantized representation
+transition cost:
+  frequency jump
+  amplitude jump
+  phase discontinuity
+  harmonic inconsistency
+  bit cost
+  predicted artifact cost
+
+Tone pruning
+
+Do not code every peak. Each candidate tone should be tested:
+
+benefit = D_without_tone - D_with_tone
+cost    = bits_for_tone + residual_side_effects
+keep tone if:
+  benefit / cost is high enough
+
+A weak tone may be cheaper to code through residual MDCT spectrum. A strong stable tone may be much better as GHA.
+
+ATRAC3plus-compatible output
+
+The encoder maps accepted candidates to legal fields such as:
+
+tone band
+number of tones
+frequency index
+amplitude scale factor
+amplitude index
+phase index
+start / stop envelope
+tone sharing
+tone master / channel swap
+phase inversion, where legal
+
+FFmpeg’s public ATRAC3plus structures show exactly these kinds of fields for groups and individual sine waves.  ￼
+
+⸻
+
+4.5 ATRAC3 tonal-component improvement
+
+Concept
+
+Plain ATRAC3 also separates tonal and non-tonal spectral components. Sony describes ATRAC3’s frequency-domain signal as being split into tonal and non-tonal components, with different procedures used to generate the bitstream.  ￼
+
+A modern ATRAC3 encoder can improve this stage even without ATRAC3plus’s richer GHA machinery.
+
+Improvements
+
+better spectral peak detection
+better tonal/noise classification
+better masking-aware tone pruning
+better frame-to-frame continuity
+better stereo-aware tonal decisions
+better residual allocation after tone extraction
+
+Theoretical reason
+
+Tonal components expose quantization noise. A small amount of noise near a steady sine-like component can be much more audible than the same noise in a dense or noise-like band.
+
+So the encoder should spend bits where:
+
+the signal is narrowband
+the tone is stable
+the tone is exposed
+masking is low
+the tone is musically salient
+the decoded error would create birdies or roughness
+
+⸻
+
+4.6 Tone / residual / noise decomposition
+
+Concept
+
+A modern encoder should classify audio components into three broad categories:
+
+1. tonal / sinusoidal
+2. residual waveform-like spectrum
+3. noise-like texture
+
+This is inspired by parametric audio coding and by PNS/noise-fill ideas, but the output remains legal ATRAC.
+
+PNS is based on the observation that noise-like signal components can be perceptually interchangeable if their spectro-temporal envelopes are similar; PNS identifies such components per band and frame and transmits envelope-like information rather than exact spectral coefficients.  ￼
+
+ATRAC cannot add AAC PNS flags, but the encoder can still use this classification internally.
+
+ATRAC3plus-compatible mapping
+
+tonal:
+  use GHA/sine tones where legal
+residual:
+  use normal spectral coefficient coding
+noise-like:
+  preserve energy/envelope
+  avoid wasting bits on exact waveform
+  use legal power/noise-compensation behavior where available
+  skip or coarsely quantize masked bands
+
+Decision examples
+
+solo flute:
+  GHA-heavy, low residual noise near partials
+cymbal wash:
+  residual/noise-heavy, avoid unstable GHA tones
+applause:
+  avoid tonal extraction, preserve texture and energy continuity
+distorted guitar:
+  mostly residual, maybe limited stable harmonic support
+vocal:
+  GHA for voiced harmonics, residual for formants/consonants
+reverb tail:
+  preserve stereo and energy; avoid over-tonalizing
+
+⸻
+
+4.7 Tonality-aware allocation and artifact avoidance
+
+Concept
+
+CELT adjusts the nature of coding noise based on tonality. The Opus spec describes a spreading-value decision where more tonal signals should receive more tonal noise, with tonality estimated from band histograms.  ￼
+
+ATRAC cannot copy CELT’s spreading transform in a legacy stream. But the encoder can use tonality estimates to guide legal choices.
+
+Tonality metrics
+
+Use a combination of:
+
+spectral flatness:
+  SFM = geometric_mean(power) / arithmetic_mean(power)
+peakiness:
+  max(power) / mean(power)
+spectral kurtosis:
+  high for peaky distributions
+phase coherence:
+  stable phase progression suggests sinusoidal content
+inter-frame peak stability:
+  stable frequency and amplitude suggest tonal content
+harmonicity:
+  peaks aligned to a common fundamental
+
+A rough tonality score:
+
+T_b = weighted_sum(
+        1 - SFM_b,
+        peakiness_b,
+        harmonicity_b,
+        phase_coherence_b,
+        interframe_stability_b
+      )
+
+Mapping to encoder behavior
+
+high tonality:
+  preserve narrow peaks
+  consider GHA/tone coding
+  avoid coarse residual quantization around partials
+  avoid unstable joint-stereo decisions
+  penalize birdie artifacts heavily
+low tonality:
+  preserve energy and texture
+  avoid wasting bits on exact coefficient positions
+  allow coarser residual coding
+  avoid extracting fake tones
+
+Artifact-specific logic
+
+birdie risk high:
+  reduce unstable tones
+  spend more residual bits around exposed peaks
+  avoid too-sparse high-band coding
+metallic ringing risk high:
+  reduce GHA on noisy material
+  increase temporal consistency penalty
+warble risk high:
+  add hysteresis to band coding decisions
+  smooth allocation across frames
+
+⸻
+
+4.8 Transient-aware gain/window decisions
+
+Concept
+
+ATRAC3 uses gain adjustment to reduce pre-echo. Sony describes pre-echo as noise occurring immediately before an attack and explains that ATRAC3 detects attacks, increases amplitude before spectral conversion, and restores level during decoding to reduce the audibility of pre-attack quantization noise.  ￼
+
+Modern encoders should use better transient detection and better scoring of temporal artifacts.
+
+AAC TNS is not compatible with ATRAC syntax, but its goal is relevant: Temporal Noise Shaping improves time-domain noise behavior and effectively enhances filterbank time resolution.  ￼
+
+Transient detector
+
+Use multiple features:
+
+time-domain energy rise
+high-frequency energy rise
+spectral flux
+complex-domain onset detection
+percussive component detector
+local crest factor
+attack slope
+inter-channel transient alignment
+
+Define attack strength:
+
+A(t) = log(E_after + ε) - log(E_before + ε)
+
+Where E_before and E_after are short-window energies around a possible attack.
+
+Pre-echo scoring
+
+For each candidate frame, decode locally and compute:
+
+error[n] = decoded[n] - source[n]
+
+Then evaluate pre-attack error:
+
+D_pre_echo =
+  Σ_attack_regions Σ_n_before_attack
+      W_attack · max(0, |error[n]| - masking_threshold[n])²
+
+The key is to penalize error before the attack more strongly than error after the attack.
+
+ATRAC-compatible mapping
+
+Use this analysis to choose legal:
+
+ATRAC3 gain-control points
+ATRAC3plus gain-control data
+ATRAC3plus window-shape decisions
+bit allocation around attack bands
+GHA tone envelopes for tonal attacks
+high-band coding around percussion
+
+Special cases
+
+castanets:
+  very high pre-echo penalty
+hi-hat:
+  high-frequency transient preservation
+snare:
+  preserve attack + avoid noisy pre-attack smear
+piano:
+  tonal attack; combine transient protection with GHA/partial tracking
+speech consonants:
+  transient-like but often center-channel critical
+
+⸻
+
+4.9 Band skipping with hysteresis
+
+Concept
+
+CELT uses band skipping when too few bits are available and adds hysteresis so that bands do not switch too aggressively from coded to uncoded. The Opus spec describes skip thresholds with hysteresis based on whether a band was coded in the previous frame.  ￼
+
+ATRAC cannot use CELT’s folding behavior directly, but it can adopt the encoder-side policy:
+
+avoid coding weak/masked bands when bits are too scarce
+avoid flickering decisions frame to frame
+
+Problem
+
+Naive band skipping causes:
+
+high-frequency pumping
+cymbal warble
+applause instability
+reverb tail flutter
+tonal birdies
+
+Hysteresis model
+
+For each band:
+
+if band was coded previously:
+    require lower threshold to keep coding
+if band was skipped previously:
+    require higher threshold to resume coding
+
+Example:
+
+code band if:
+  perceptual_importance > T_on
+keep coding if already coded and:
+  perceptual_importance > T_keep
+where:
+  T_keep < T_on
+
+ATRAC-compatible mapping
+
+Use hysteresis to decide:
+
+coded subband count
+used quantization units
+word length = 0 vs nonzero
+high-band omission
+noise/power-compensation strategy
+
+Mode-specific policy
+
+Hi-SP / 256 kbps:
+  skip conservatively
+  prioritize transparency
+Hi-LP / 64 kbps:
+  skip aggressively but smoothly
+  preserve energy and texture
+ATRAC3 LP4 / 66 kbps:
+  strong high-band management required
+  avoid unstable stereo/high-frequency coding
+ATRAC3 LP2 / 132 kbps:
+  less aggressive skipping
+  preserve more stereo and transient detail
+
+⸻
+
+4.10 High-frequency strategy
+
+Concept
+
+Do not use a fixed crude lowpass. High-frequency content should be handled according to content type.
+
+Classification
+
+tonal high-frequency content:
+  bells, harmonics, synths
+  → preserve peaks if exposed
+noise-like high-frequency content:
+  cymbals, hiss, ambience
+  → preserve energy/texture more than exact waveform
+masked high-frequency content:
+  dense mix, loud lower bands
+  → omit or coarsely code
+stereo ambience:
+  reverb, audience, room tone
+  → preserve width and smoothness
+
+Why this matters
+
+At low bitrates, exact high-frequency coefficients often cost too much. But simply deleting high frequencies can make the output sound dull or unstable. The encoder should choose among:
+
+preserve exact coefficients
+preserve tonal peaks
+preserve energy envelope
+use legal noise/power compensation
+skip smoothly
+lowpass
+
+ATRAC-compatible mapping
+
+coded high subbands
+high-band scale factors
+word lengths
+ATRAC3plus tone bands
+noise-level choices
+stereo decisions in high bands
+
+⸻
+
+4.11 Stereo-image-aware joint stereo
+
+Concept
+
+Legacy codecs often use correlation to decide joint stereo. A modern encoder should also score stereo image quality.
+
+CELT’s reference encoder compares mid-side and left/right representations using estimated entropy, and the Opus spec notes that CELT applies mid-side coupling in a normalized domain.  ￼
+
+ATRAC cannot copy normalized-domain CELT stereo coding, but the analysis can improve ATRAC stereo decisions.
+
+Stereo features
+
+Compute per band:
+
+inter-channel correlation
+mid energy
+side energy
+side/mid ratio
+inter-channel phase difference
+inter-channel level difference
+center-vocal likelihood
+hard-panned transient likelihood
+ambience / decorrelation likelihood
+
+Candidate scoring
+
+Penalize:
+
+center vocal shift
+side-channel collapse
+ambience narrowing
+hard-panned transient smearing
+phasey vocal artifacts
+reverb modulation
+stereo flicker between frames
+
+ATRAC-compatible mapping
+
+Use the analysis to choose:
+
+independent stereo vs joint stereo
+joint-stereo parameters
+ATRAC3plus tone sharing
+channel swapping / tone master flags where legal
+phase inversion flags where legal
+side-channel bit allocation
+high-frequency stereo simplification thresholds
+
+Practical rule set
+
+center vocal:
+  preserve mid clarity
+  avoid decisions that roughen vocal formants
+wide reverb:
+  preserve side energy continuity
+  avoid aggressive high-band stereo collapse
+hard-panned percussion:
+  avoid joint stereo that pulls attack to center
+bass:
+  joint coding is often safe, but protect attack and phase
+applause:
+  avoid unstable stereo simplification; decorrelation matters
+
+⸻
+
+4.12 Source-aware classification
+
+Concept
+
+Modern codecs such as USAC/xHE-AAC were designed around mixed speech/audio handling; xHE-AAC is described by Fraunhofer as bridging speech and audio coding at very low bitrates.  ￼
+
+ATRAC cannot add USAC speech tools. But source classification is still valuable inside the encoder.
+
+Classifiers
+
+Useful labels:
+
+voiced speech
+unvoiced speech
+singing voice
+solo tonal instrument
+dense music
+percussion-heavy music
+cymbal/noise-heavy music
+applause/crowd
+reverb/ambience
+bass-dominant material
+synthetic tonal material
+
+Strategy table
+
+Content type	Encoder strategy
+Voiced speech	Preserve pitch harmonics, formant energy, center image
+Unvoiced speech	Preserve transient/noise envelope, avoid fake tones
+Singing voice	Combine GHA tracking with formant-band residual protection
+Solo piano	Strong transient + tonal handling; avoid pre-echo and tone flicker
+Cymbals	Avoid unstable GHA; preserve high-band texture and energy
+Applause	Treat as decorrelated noise-like texture; avoid tonal birdies
+Dense rock/metal	Focus on energy envelope and stereo stability; use GHA conservatively
+Bass-heavy music	Preserve low-band energy and attack timing
+Reverb tails	Preserve smooth decay and stereo width
+Synth leads	GHA/tonal tracking can be valuable
+
+Why this helps
+
+A single psychoacoustic model often misclassifies edge cases. Source-aware classification lets the encoder change its priorities without changing the decoder.
+
+⸻
+
+4.13 PNS/noise-fill-inspired noise handling
+
+Concept
+
+PNS and later noise-fill tools are based on the idea that exact noise waveforms are often perceptually unimportant if the spectro-temporal envelope is preserved.  ￼
+
+ATRAC3plus already has decoder-visible noise-related fields in public implementations, including noise-level and noise-table indexes.  ￼
+
+Encoder-side adaptation
+
+detect noise-like bands
+preserve their energy envelope
+avoid spending bits on exact random detail
+use legal ATRAC3plus noise/power compensation where available
+skip masked bands smoothly
+avoid fake tonal extraction
+
+Noise-likeness metrics
+
+spectral flatness
+low phase coherence
+low inter-frame peak stability
+high local entropy
+broadband energy distribution
+absence of harmonic structure
+
+Good candidates
+
+cymbal wash
+tape hiss
+audience noise
+room tone
+wind noise
+breathy consonants
+reverb tails
+
+Bad candidates
+
+bells
+flute
+solo violin
+vocal harmonics
+synth leads
+piano partials
+
+⸻
+
+4.14 AAC TNS-inspired temporal distortion scoring
+
+Concept
+
+AAC TNS itself is not backward-compatible with ATRAC. But its underlying concern is directly relevant: quantization noise can be shaped in time to reduce artifacts around transient or speech-like signals. Fraunhofer’s MP3/AAC overview describes TNS as providing noise shaping in the time domain and virtually enhancing the filterbank’s time resolution.  ￼
+
+ATRAC-compatible adaptation
+
+Use TNS-like analysis only in the scorer, not the bitstream.
+
+candidate A:
+  lower spectral error
+  higher pre-echo
+candidate B:
+  higher spectral error
+  lower pre-echo
+choose candidate B if temporal masking says it sounds better
+
+Implementation
+
+Compute error distribution inside each frame:
+
+for each transient region:
+    measure error before attack
+    measure error during attack
+    measure error after attack
+
+Then apply temporal masking weights:
+
+pre-attack error:
+  high penalty
+post-attack error:
+  lower penalty if masked by attack
+stationary region error:
+  normal masking model
+
+Useful for
+
+speech
+castanets
+snare
+hi-hat
+piano
+plucked guitar
+harpsichord
+glockenspiel
+
+⸻
+
+4.15 LAME/GPSYCHO-style psychoacoustic engineering
+
+Concept
+
+One of the most important lessons from MP3 is that a fixed old bitstream can improve dramatically through better encoders. LAME’s GPSYCHO page describes improvements over ISO demonstration psychoacoustic modeling, including mid/side stereo, bit reservoir control, critical-band allocation, VBR, and pre-echo control.  ￼
+
+For ATRAC, this suggests a very practical path:
+
+do not only implement the spec
+build a listening-test-driven encoder
+
+Killer-sample corpus
+
+Create a permanent regression set:
+
+castanets
+applause
+harpsichord
+solo piano
+female vocal
+male vocal
+sibilant speech
+dense metal
+cymbal wash
+orchestral strings
+bells
+glockenspiel
+bass drops
+synth sweeps
+stereo ambience
+live audience recordings
+low-level reverb tails
+
+Artifact labels
+
+Each sample should have expected failure modes:
+
+pre-echo
+birdies
+warble
+metallic ringing
+stereo collapse
+vocal roughness
+bass pumping
+cymbal smearing
+tone flicker
+high-band dullness
+reverb modulation
+
+Workflow
+
+1. Encode with current encoder.
+2. Decode through reference software decoder.
+3. Decode through physical hardware where possible.
+4. Score objectively.
+5. Listen blind.
+6. Add failing sample to regression set.
+7. Adjust model/search.
+8. Repeat.
+
+Why this matters
+
+For backward-compatible codecs, the bitstream is frozen. The encoder quality is largely determined by:
+
+psychoacoustic model quality
+search quality
+artifact-specific heuristics
+training corpus
+hardware compatibility testing
+
+⸻
+
+4.16 Beam search / trellis search over legal syntax
+
+Concept
+
+Many ATRAC decisions interact. A beam search keeps multiple partial candidates alive instead of committing too early.
+
+stage 1: candidate gain/window decisions
+stage 2: candidate tone sets
+stage 3: candidate stereo modes
+stage 4: candidate residual allocations
+stage 5: candidate scale factors / word lengths
+stage 6: local decode and score
+
+At each stage:
+
+expand candidates
+estimate bit cost
+estimate distortion
+keep top N
+discard rest
+
+Why this helps
+
+A locally optimal tone decision can be globally bad:
+
+coding tone A:
+  improves harmonic peak
+  costs many bits
+  starves nearby residual
+  creates worse total artifact
+
+Beam search can discover that a slightly worse tone choice leaves enough bits for better residual coding.
+
+Pseudocode
+
+beam = [empty_candidate]
+for stage in encoder_stages:
+    new_beam = []
+    for cand in beam:
+        for option in legal_options(stage, cand):
+            cand2 = apply(cand, option)
+            if bit_cost(cand2) <= frame_budget_upper_bound:
+                cand2.estimate = fast_score(cand2)
+                new_beam.append(cand2)
+    beam = keep_best(new_beam, beam_width)
+final_candidates = []
+for cand in beam:
+    bitstream = atrac_encode(cand)
+    decoded   = atrac_decode(bitstream)
+    score     = perceptual_score(source, decoded, cand)
+    final_candidates.append((score, bitstream))
+return best(final_candidates)
+
+Suggested beam widths
+
+realtime:
+  1–4
+high quality:
+  8–32
+offline archival:
+  64–256, plus multi-frame lookahead
+
+⸻
+
+4.17 Multi-frame lookahead
+
+Concept
+
+Some artifacts are temporal:
+
+tone flicker
+band pumping
+stereo flicker
+reverb tail discontinuity
+bit-allocation instability
+
+A frame-by-frame optimizer may choose a locally good frame that causes bad transitions. Multi-frame lookahead adds continuity.
+
+Objective
+
+Instead of minimizing:
+
+D(frame_t)
+
+Minimize:
+
+D(frame_t) + α · transition_cost(frame_t-1, frame_t)
+
+Or with lookahead:
+
+Σ_{i=t}^{t+L} D(frame_i)
++ α Σ_{i=t}^{t+L} transition_cost(frame_i-1, frame_i)
+
+Transition penalties
+
+sudden coded-band changes
+sudden high-frequency cutoff changes
+sudden stereo-mode changes
+GHA tone appearing/disappearing abruptly
+partial frequency jumps
+gain/window decision instability
+large band-energy discontinuities
+
+ATRAC-compatible mapping
+
+The emitted frames are still normal ATRAC frames. The encoder simply chooses more temporally stable legal parameters.
+
+⸻
+
+4.18 Artifact-specific detectors
+
+Concept
+
+A modern encoder should explicitly predict known codec artifacts.
+
+Useful detectors
+
+pre_echo_detector
+birdie_detector
+tone_flicker_detector
+cymbal_warble_detector
+stereo_collapse_detector
+vocal_roughness_detector
+bass_pumping_detector
+reverb_tail_modulation_detector
+applause_instability_detector
+metallic_ringing_detector
+
+Example: birdie detector
+
+Birdies often occur when high-frequency sparse quantization creates isolated tonal artifacts.
+
+Features:
+
+high-frequency band
+low bit allocation
+sparse decoded spectrum
+source is noise-like
+decoded has narrow peaks
+peaks are unstable across frames
+
+Penalty:
+
+D_birdie =
+  high_band_weight
+  · noise_like_source_score
+  · decoded_peakiness
+  · interframe_instability
+
+Example: stereo-collapse detector
+
+Features:
+
+source side energy high
+decoded side energy low
+decorrelation high
+reverb/ambience classifier high
+headphone-risk region
+
+Penalty:
+
+D_stereo =
+  Σ_b W_b · max(0, side_src_b - side_dec_b)²
+
+Example: tone-flicker detector
+
+Features:
+
+GHA tone appears/disappears rapidly
+frequency index changes sharply
+amplitude envelope jumps
+source partial is stable
+
+Penalty:
+
+D_flicker =
+  stability_src · instability_dec · audibility_weight
+
+⸻
+
+4.19 Neural perceptual scoring, without neural decoding
+
+Concept
+
+Modern machine learning can help the encoder decide which legal ATRAC frame sounds better. It must not be part of the decoder.
+
+source audio
+candidate decoded audio
+candidate parameters
+artifact features
+  → neural scorer
+  → predicted perceptual quality
+
+The output is still a normal ATRAC bitstream.
+
+Good uses
+
+predict birdies
+predict cymbal warble
+predict pre-echo
+predict stereo collapse
+predict vocal roughness
+predict low-bitrate annoyance
+rank candidate frames
+suggest search directions
+
+Bad uses
+
+do not emit neural tokens
+do not require neural reconstruction
+do not rely on decoder-side neural enhancement
+do not alter the bitstream
+
+Training data
+
+Use paired examples:
+
+source audio
+encoded/decoded ATRAC output
+encoder parameters
+objective features
+listening-test labels or preferences
+
+Train the model to answer:
+
+candidate A or candidate B: which sounds better?
+
+A pairwise preference model may be more useful than an absolute quality predictor.
+
+⸻
+
+4.20 Learned encoder policy
+
+Concept
+
+A neural or statistical model can propose good legal parameters before the exact search.
+
+analysis features
+  → model
+  → suggested tone count, allocation, stereo mode, gain strategy
+  → legal candidate generator
+  → exact local decode/search verification
+
+Why use it
+
+Search over all legal ATRAC3plus choices can be expensive. A learned policy can narrow the search.
+
+Safety rule
+
+The learned policy is advisory only:
+
+ML proposes.
+ATRAC syntax validator enforces.
+local decoder verifies.
+perceptual scorer selects.
+
+⸻
+
+4.21 Differentiable or surrogate ATRAC model
+
+Concept
+
+ATRAC encoding is full of discrete decisions, so direct gradient optimization is hard. But one can train a surrogate model:
+
+candidate parameter vector
+source features
+  → surrogate
+  → predicted decoded features / artifact scores
+
+Then use the surrogate to explore many candidates cheaply, followed by exact validation.
+
+Use case
+
+1. Generate thousands of possible parameter configurations.
+2. Use surrogate to discard bad ones.
+3. Exactly encode/decode the top candidates.
+4. Score with full perceptual model.
+5. Emit best legal stream.
+
+Compatibility
+
+Fully compatible, because the surrogate exists only inside the encoder.
+
+⸻
+
+4.22 Perceptual preconditioning of the input
+
+Concept
+
+The encoder may make small, controlled changes before encoding if they reduce worse codec artifacts and remain perceptually transparent.
+
+This is delicate and should be optional.
+
+Examples:
+
+very mild inaudible dither before analysis
+subsonic/DC cleanup
+clipping repair before encoding
+ultrasonic removal before 44.1 kHz coding
+micro-level transient conditioning
+
+Risks
+
+This can become destructive if abused:
+
+dulls transients
+changes mix tonality
+narrows stereo
+alters artistic intent
+hides encoder weakness by preprocessing
+
+Recommended policy
+
+Use only:
+
+DC removal
+true-peak-safe level handling
+clipping detection / optional repair
+very conservative anti-alias filtering
+
+Avoid heavy preprocessing unless the user explicitly selects an “artifact-reduction” mode.
+
+⸻
+
+4.23 Loudness- and level-aware encoding
+
+Concept
+
+Masking thresholds depend on playback level, but the encoder usually does not know playback level. It can still avoid obvious level-related failures.
+
+Improvements
+
+detect clipping
+preserve headroom
+avoid scale-factor choices that create overload after decode
+track true peak
+detect very quiet passages
+increase penalties for artifacts in exposed quiet regions
+
+Quiet passages
+
+In quiet passages:
+
+masking is weak
+pre-echo is more audible
+birdies are more audible
+stereo ambience may be exposed
+tone flicker is easier to hear
+
+The encoder should spend bits differently for exposed quiet material than for loud dense material.
+
+⸻
+
+4.24 Hardware-conservative syntax selection
+
+Concept
+
+A bitstream can be technically decodable by software but still risky on real hardware. Physical players may be less forgiving about rare legal edge cases.
+
+Strategy
+
+Maintain a conservative compatibility profile:
+
+avoid rarely used syntax combinations
+avoid extreme parameter values unless necessary
+avoid unusual frame transitions
+validate against multiple software decoders
+validate against multiple physical devices
+test all target modes separately
+
+Test matrix
+
+ATRAC3 LP2
+ATRAC3 LP4
+ATRAC3plus Hi-SP
+ATRAC3plus Hi-LP
+ATRAC3plus transfer-only rates, if targeted
+mono
+stereo
+joint stereo
+quiet tracks
+short tracks
+long tracks
+gapless transitions
+track boundaries
+battery-powered playback
+different Sony hardware generations
+
+Practical rule
+
+The encoder should have two syntax modes:
+
+spec-maximal:
+  uses all known legal features
+hardware-safe:
+  avoids edge cases and prioritizes device compatibility
+
+For physical MiniDisc/Hi-MD, hardware-safe should be the default.
+
+⸻
+
+5. ATRAC3plus-specific recommendations
+
+5.1 Treat GHA as the central quality lever
+
+For Hi-MD / ATRAC3plus, GHA is the most important native feature to exploit.
+
+Recommended priorities:
+
+1. high-quality sinusoidal peak detection
+2. harmonic grouping
+3. partial tracking across frames
+4. bit-cost-aware tone pruning
+5. stereo-aware tone sharing
+6. tone/residual/noise classification
+7. local decode verification
+
+Do not overuse GHA
+
+Overusing GHA on noisy material causes:
+
+birdies
+metallic ringing
+fake tones
+cymbal artifacts
+applause artifacts
+wrong stereo localization
+
+Use GHA when the component is:
+
+stable
+narrowband
+audible
+not adequately represented by residual coding
+worth the bit cost
+
+5.2 Use residual spectrum to support tones
+
+GHA should not replace residual coding. It should reduce the burden on residual coding.
+
+source = tones + residual + noise-like texture
+
+After accepting a tone candidate, the encoder should evaluate the residual:
+
+residual = source - synthesized_candidate_tones
+
+Then determine whether the remaining residual is easier to code.
+
+A tone should be rejected if it makes the residual harder to code or causes a worse decoded perceptual result.
+
+5.3 Stereo-aware GHA
+
+For stereo tones:
+
+if tone is centered:
+  use sharing where legal and stable
+if tone is hard-panned:
+  avoid forcing shared tone representation
+if tone differs by phase:
+  preserve phase/stereo relation if syntax allows
+if ambience is decorrelated:
+  avoid fake shared tones
+
+Public ATRAC3plus structures include tone-sharing, channel-swapping, and phase-inversion-related fields, so a modern encoder should make those decisions carefully.  ￼
+
+⸻
+
+6. ATRAC3-specific recommendations
+
+ATRAC3 has fewer tools than ATRAC3plus, so the highest-value areas are:
+
+closed-loop scale-factor / word-length search
+better tonal/non-tonal separation
+transient-aware gain control
+band-energy preservation
+joint-stereo decision improvement
+high-frequency management
+band skipping with hysteresis
+killer-sample-driven tuning
+
+ATRAC3’s native tonal/non-tonal separation is less expressive than ATRAC3plus GHA, but it is still useful. The encoder should improve the selection and bit allocation around tonal components rather than trying to invent new representations.
+
+⸻
+
+7. Suggested perceptual scoring model
+
+A practical scorer can be modular:
+
+score =
+  energy_score
++ tonal_score
++ transient_score
++ stereo_score
++ noise_texture_score
++ temporal_continuity_score
++ artifact_score
+
+7.1 Energy score
+
+energy_score =
+  Σ_b,t W_b,t · |log(E_dec(b,t)+ε) - log(E_src(b,t)+ε)|^p
+
+Use p = 1 for robustness or p = 2 for stronger penalties.
+
+7.2 Tonal score
+
+tonal_score =
+  Σ_tones audibility_i · (
+      frequency_error_i
+    + amplitude_error_i
+    + phase_error_i_if_relevant
+    + continuity_error_i
+  )
+
+7.3 Transient score
+
+transient_score =
+  Σ_attacks (
+      pre_echo_penalty
+    + attack_blur_penalty
+    + high_band_attack_loss
+  )
+
+7.4 Stereo score
+
+stereo_score =
+  Σ_b,t (
+      mid_energy_error
+    + side_energy_error
+    + correlation_error
+    + image_shift_penalty
+  )
+
+7.5 Noise texture score
+
+noise_texture_score =
+  envelope_error
++ decoded_peakiness_penalty
++ temporal_modulation_penalty
++ fake_tone_penalty
+
+7.6 Temporal continuity score
+
+continuity_score =
+  band_energy_jump_penalty
++ coded_band_flicker_penalty
++ tone_flicker_penalty
++ stereo_mode_flicker_penalty
+
+⸻
+
+8. Search strategy by quality mode
+
+8.1 Fast mode
+
+single-pass analysis
+limited GHA candidates
+simple allocation
+small closed-loop adjustment
+
+Use for real-time or near-real-time encoding.
+
+8.2 High-quality mode
+
+multi-candidate GHA search
+closed-loop scale-factor optimization
+transient candidate testing
+stereo candidate testing
+band-energy scoring
+artifact detectors
+
+Use for normal PC-to-MD transfer.
+
+8.3 Archival/offline mode
+
+multi-frame lookahead
+beam search
+large GHA candidate pool
+hardware-safe syntax filtering
+neural perceptual scorer
+killer-sample-tuned artifact penalties
+slow exact local decode loop
+
+Use when encode time is not important.
+
+⸻
+
+9. Development roadmap
+
+Phase 1: reference-compatible encoder core
+
+implement legal ATRAC3 / ATRAC3plus syntax
+implement exact bit counting
+implement local software decoder loop
+validate against known decoders
+validate basic hardware playback
+
+Phase 2: perceptual model baseline
+
+critical-band energy model
+basic masking model
+tonality detector
+transient detector
+stereo analyzer
+basic artifact detectors
+
+Phase 3: closed-loop optimization
+
+scale-factor search
+word-length search
+coded-band search
+stereo mode search
+gain/window candidate testing
+
+Phase 4: GHA/tone system
+
+peak detection
+harmonic grouping
+partial tracking
+tone pruning
+tone/residual/noise split
+stereo-aware tone sharing
+closed-loop GHA verification
+
+Phase 5: high-frequency and noise strategy
+
+noise-like band classification
+dynamic high-band policy
+band skipping with hysteresis
+ATRAC3plus noise/power compensation tuning
+applause/cymbal-specific artifact reduction
+
+Phase 6: machine-learning assistance
+
+train artifact predictor
+train candidate ranker
+train parameter proposal model
+verify all ML output through legal encoder + local decoder
+
+Phase 7: listening-test tuning
+
+ABX tests
+MUSHRA-style tests
+killer-sample regression
+hardware playback verification
+headphone and speaker checks
+mode-specific tuning
+
+⸻
+
+10. Highest-value ideas to prioritize
+
+For a modern Hi-MD-compatible ATRAC3plus encoder, the top priorities are:
+
+1. GHA/sinusoidal partial tracking
+2. closed-loop encode/decode optimization
+3. band-energy preservation
+4. tone/residual/noise decomposition
+5. transient-aware gain/window decisions
+6. stereo-image-aware joint stereo and tone sharing
+7. high-frequency noise/texture strategy
+8. band skipping with hysteresis
+9. artifact-specific detectors
+10. killer-sample-driven tuning
+
+For a modern MDLP-compatible ATRAC3 encoder, the top priorities are:
+
+1. closed-loop scale-factor and word-length optimization
+2. improved tonal/non-tonal separation
+3. transient-aware gain-control selection
+4. band-energy preservation
+5. joint-stereo decision improvement
+6. high-frequency management
+7. band skipping with hysteresis
+8. artifact-specific regression testing
+
+⸻
+
+11. Key non-goals
+
+These ideas are technically interesting but should not be used for strict hardware compatibility:
+
+Idea	Why excluded
+CELT PVQ core coding	Old ATRAC decoders cannot parse it
+Opus range coder	Changes entropy syntax
+CELT pitch postfilter side data	Requires new decoder behavior
+AAC TNS syntax	Not part of ATRAC bitstream
+AAC PNS flags	Not part of ATRAC bitstream
+USAC ACELP/TCX	Requires different decoder
+SBR/eSBR	Requires high-band reconstruction tool
+Parametric stereo side data	Requires new stereo decoder tool
+Neural codec RVQ tokens	Requires neural decoder
+Enhancement residual layer	Not playable by ordinary physical MD/Hi-MD decoders
+New GHA parameters	Old ATRAC3plus decoders do not know them
+
+⸻
+
+12. Summary
+
+A modern backward-compatible ATRAC encoder should not try to turn ATRAC into Opus, AAC, USAC, or a neural codec. The better approach is:
+
+keep the legacy decoder model fixed
+use modern analysis to understand the signal
+generate many legal ATRAC candidates
+decode those candidates locally
+score the actual decoded result perceptually
+emit only the best legal legacy frame
+
+For ATRAC3plus / Hi-MD, the most promising path is:
+
+modern GHA analysis
++ HILN-like tone/residual/noise decomposition
++ CELT-like band-energy preservation logic
++ AAC/TNS-inspired temporal artifact scoring
++ PNS/noise-fill-inspired noise classification
++ USAC/EVS-style source classification
++ LAME-style psychoacoustic tuning
++ beam-search / closed-loop R-D optimization
+= better ATRAC3plus bitstreams that still play on existing Hi-MD hardware
+
+For ATRAC3 / MDLP, the same philosophy applies, but with fewer native tools:
+
+better tonal selection
+better gain-control decisions
+better allocation
+better stereo decisions
+better high-frequency policy
+better closed-loop scoring
+
+The central compatibility principle remains:
+
+All modern intelligence lives in the encoder.
+The decoder receives ordinary ATRAC.

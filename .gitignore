@@ -1,0 +1,14 @@
+/target
+.DS_Store
+/output
+__pycache__/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz

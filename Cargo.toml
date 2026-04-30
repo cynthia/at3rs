@@ -1,0 +1,10 @@
+[package]
+name = "at3rs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+publish = false
+
+[dependencies]
+lazy_static = "1.4"
+rustfft = "6.4.1"
