@@ -84,6 +84,8 @@ pub struct Atrac3Context {
     loudness_state: f32,
     gain_last_level: [[f32; 4]; 2],
     gain_last_target: [[f32; 4]; 2],
+    prev_bfu_coded: [[bool; 32]; 2],
+    prev_bfu_ready: [bool; 2],
 }
 
 impl Atrac3Context {
@@ -126,6 +128,8 @@ impl Atrac3Context {
             loudness_state: ATRAC3_LOUDNESS_FACTOR,
             gain_last_level: [[0.0; 4]; 2],
             gain_last_target: [[0.0; 4]; 2],
+            prev_bfu_coded: [[false; 32]; 2],
+            prev_bfu_ready: [false; 2],
         }
     }
 
@@ -417,8 +421,18 @@ impl Atrac3Context {
             self.remove_tonal_components_from_residual(&mut residual_spectrum, &tonal_components);
             let extra_header_bits = self.gain_extra_bits(&frame_gains[ch], 4)
                 + self.tonal_components_extra_bits(&tonal_components, 4);
-            let plans =
-                self.build_bfu_plan(ch, &residual_spectrum, loudness_norm, extra_header_bits);
+            let prev_bfu_coded = if self.prev_bfu_ready[ch] {
+                Some(&self.prev_bfu_coded[ch])
+            } else {
+                None
+            };
+            let plans = self.build_bfu_plan(
+                ch,
+                &residual_spectrum,
+                loudness_norm,
+                extra_header_bits,
+                prev_bfu_coded,
+            );
             if self.stage_debug_enabled() {
                 eprintln!("encode_frame:write ch={}", ch);
             }
@@ -430,6 +444,10 @@ impl Atrac3Context {
                 channel_budget_bytes,
             );
             self.store_quantized_channel_spectrum(ch, &plans);
+            for plan in &plans {
+                self.prev_bfu_coded[ch][plan.block] = plan.table_idx != 0;
+            }
+            self.prev_bfu_ready[ch] = true;
             frame_bytes.extend_from_slice(&unit_bytes);
         }
 
@@ -758,7 +776,7 @@ impl Atrac3Context {
         max_quant: f32,
         quant_limit: i16,
     ) -> (Vec<i16>, f32) {
-        if block > 18 {
+        if block > 18 || (block >= 6 && self.spectral_flatness(scaled) >= 0.18) {
             self.quantize_block_energy_adjusted(scaled, max_quant, quant_limit)
         } else {
             self.quantize_block_plain(scaled, max_quant, quant_limit)
@@ -809,12 +827,13 @@ impl Atrac3Context {
                 let diff = orig - recon;
                 mse += diff * diff;
             }
-            let energy_log_error = (recon_energy.max(1.0e-18) / source_energy).log2().abs();
+            let (detail_weight, energy_weight) = self.texture_error_weights(spectrum);
+            let energy_log_error = self.asymmetric_energy_log_error(source_energy, recon_energy);
             let normalized_mse = mse / source_energy;
             let saturation_penalty = saturated as f32 / spectrum.len().max(1) as f32;
             let sf_distance = (sf_idx as i32 - base_sf as i32).unsigned_abs() as f32;
-            let score = normalized_mse
-                + 0.30 * energy_log_error
+            let score = detail_weight * normalized_mse
+                + energy_weight * energy_log_error
                 + 2.0 * saturation_penalty
                 + 0.002 * sf_distance;
 
@@ -1462,6 +1481,7 @@ impl Atrac3Context {
         spectrum: &[f32; 1024],
         loudness_norm: f32,
         extra_header_bits: usize,
+        prev_bfu_coded: Option<&[bool; 32]>,
     ) -> Vec<BfuCoding> {
         if self.stage_debug_enabled() {
             eprintln!("build_bfu_plan:start ch={}", ch);
@@ -1554,7 +1574,11 @@ impl Atrac3Context {
                     shift,
                     band_boost,
                 );
-                if stat.energy < ATRAC3_ATH_BFU[block] * loudness_norm * ath_gate_scale {
+                let mut skip_threshold = ATRAC3_ATH_BFU[block] * loudness_norm * ath_gate_scale;
+                if let Some(prev) = prev_bfu_coded {
+                    skip_threshold *= if prev[block] { 0.82 } else { 1.12 };
+                }
+                if stat.energy < skip_threshold {
                     table_idx = 0;
                 }
 
@@ -1719,7 +1743,7 @@ impl Atrac3Context {
 
         for ch in 0..self.channels as usize {
             let flat_spectrum = flat_spectra[ch];
-            let plans = self.build_bfu_plan(ch, &flat_spectrum, loudness_norm.max(0.001), 0);
+            let plans = self.build_bfu_plan(ch, &flat_spectrum, loudness_norm.max(0.001), 0, None);
 
             let (pcm_rms, pcm_max) = self.rms_and_max(&planar_pcm[ch]);
             let mut bands = Vec::with_capacity(4);
@@ -1837,13 +1861,50 @@ impl Atrac3Context {
             recon_energy += recon * recon;
         }
 
-        let energy_error = if source_energy > 1.0e-18 {
-            (recon_energy.max(1.0e-18) / source_energy).log2().abs()
-        } else {
-            0.0
-        };
+        let (detail_weight, energy_weight) = self.texture_error_weights(spectrum);
+        let energy_error = self.asymmetric_energy_log_error(source_energy, recon_energy);
         let normalized_energy_error = energy_error * source_energy.max(1.0e-18);
-        (distortion + 0.35 * normalized_energy_error) * (1.0 + plan.importance)
+        (detail_weight * distortion + energy_weight * normalized_energy_error)
+            * (1.0 + plan.importance)
+    }
+
+    fn asymmetric_energy_log_error(&self, source_energy: f32, recon_energy: f32) -> f32 {
+        if source_energy <= 1.0e-18 {
+            return 0.0;
+        }
+
+        let log_ratio = (recon_energy.max(1.0e-18) / source_energy).log2();
+        if log_ratio < 0.0 {
+            log_ratio.abs() * 1.3
+        } else {
+            log_ratio * 0.95
+        }
+    }
+
+    fn texture_error_weights(&self, spectrum: &[f32]) -> (f32, f32) {
+        if spectrum.is_empty() {
+            return (1.0, 0.35);
+        }
+
+        let mut energy = 0.0f32;
+        let mut peak = 0.0f32;
+        for &coeff in spectrum {
+            let e = coeff * coeff;
+            energy += e;
+            peak = peak.max(e);
+        }
+        if energy <= 1.0e-18 {
+            return (1.0, 0.35);
+        }
+
+        let flatness = self.spectral_flatness(spectrum);
+        let crest = (peak / (energy / spectrum.len() as f32)).max(1.0);
+        let peakiness = ((crest.log2() - 1.0) / 5.0).clamp(0.0, 1.0);
+        let tonality = (0.65 * (1.0 - flatness) + 0.35 * peakiness).clamp(0.0, 1.0);
+
+        let detail_weight = 0.85 + 0.35 * tonality;
+        let energy_weight = 0.25 + 0.20 * flatness + 0.10 * (1.0 - tonality);
+        (detail_weight, energy_weight)
     }
 
     fn bfu_plan_bits(&self, plans: &[BfuCoding]) -> usize {
