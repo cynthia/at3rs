@@ -753,6 +753,84 @@ impl Atrac3Context {
         (mantissas, energy_err)
     }
 
+    fn quantize_block_texture_adjusted(
+        &self,
+        scaled: &[f32],
+        max_quant: f32,
+        quant_limit: i16,
+    ) -> (Vec<i16>, f32) {
+        let mut mantissas = vec![0i16; scaled.len()];
+        let mut orig_energy = 0.0f32;
+        let mut recon_energy = 0.0f32;
+        let inv2 = 1.0 / (max_quant * max_quant);
+        let limit = quant_limit as i32;
+
+        for (i, &value) in scaled.iter().enumerate() {
+            let t = value * max_quant;
+            orig_energy += value * value;
+            let q = self.round_ties_even(t).clamp(-limit, limit) as i16;
+            mantissas[i] = q;
+            recon_energy += (q as f32) * (q as f32) * inv2;
+        }
+
+        if orig_energy > 1.0e-12 {
+            for _ in 0..scaled.len().min(16) {
+                let current_error = (recon_energy - orig_energy).abs();
+                let mut best: Option<(f32, usize, i16, f32)> = None;
+
+                for (i, &value) in scaled.iter().enumerate() {
+                    let q = mantissas[i] as i32;
+                    let mut candidates = [q, q];
+                    if recon_energy < orig_energy {
+                        if q.abs() >= limit {
+                            continue;
+                        }
+                        candidates[0] = if value >= 0.0 { q + 1 } else { q - 1 };
+                    } else {
+                        if q == 0 {
+                            continue;
+                        }
+                        candidates[0] = if q > 0 { q - 1 } else { q + 1 };
+                    }
+
+                    for &candidate in candidates.iter().take(1) {
+                        if candidate.abs() > limit {
+                            continue;
+                        }
+                        let next_energy = recon_energy - (q * q) as f32 * inv2
+                            + (candidate * candidate) as f32 * inv2;
+                        let next_error = (next_energy - orig_energy).abs();
+                        if next_error >= current_error {
+                            continue;
+                        }
+                        let coeff_error = (value - candidate as f32 / max_quant).abs();
+                        let score = next_error + coeff_error * 1.0e-4;
+                        if best
+                            .as_ref()
+                            .map(|(best_score, _, _, _)| score < *best_score)
+                            .unwrap_or(true)
+                        {
+                            best = Some((score, i, candidate as i16, next_energy));
+                        }
+                    }
+                }
+
+                let Some((_, idx, q, next_energy)) = best else {
+                    break;
+                };
+                mantissas[idx] = q;
+                recon_energy = next_energy;
+            }
+        }
+
+        let energy_err = if recon_energy > 1.0e-12 {
+            orig_energy / recon_energy
+        } else {
+            1.0
+        };
+        (mantissas, energy_err)
+    }
+
     fn scale_factor_search_enabled(&self) -> bool {
         self.config.scale_factor_search_enabled()
     }
@@ -776,7 +854,9 @@ impl Atrac3Context {
         max_quant: f32,
         quant_limit: i16,
     ) -> (Vec<i16>, f32) {
-        if block > 18 || (block >= 6 && self.spectral_flatness(scaled) >= 0.18) {
+        if block >= 6 && self.spectral_flatness(scaled) >= 0.18 {
+            self.quantize_block_texture_adjusted(scaled, max_quant, quant_limit)
+        } else if block > 18 {
             self.quantize_block_energy_adjusted(scaled, max_quant, quant_limit)
         } else {
             self.quantize_block_plain(scaled, max_quant, quant_limit)
