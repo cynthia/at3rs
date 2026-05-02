@@ -85,6 +85,20 @@ Run only the at3rs encode paths:
 python3 eval/run_eval.py fixtures --no-sony-reference
 ```
 
+Run closed-loop candidate selection for a fixture:
+
+```sh
+python3 eval/closed_loop_candidates.py fixtures/billiejean_30s.wav
+```
+
+This encodes several legal at3rs variants, decodes each one with the Sony PSP
+tool, scores the decoded WAVs, and copies the selected candidate to
+`selected/selected.at3` and `selected/selected_sony.wav`. The default selector
+is `--score-mode guarded-peaq`: it prefers PEAQ, but rejects candidates that
+fall more than `--snr-tolerance-db` or `--visqol-tolerance` behind the best
+candidate for that fixture. Use `--score-mode peaq`, `visqol`, or `snr` to make
+the tradeoff explicit.
+
 Use an explicit tools directory:
 
 ```sh
@@ -115,6 +129,18 @@ output/<git-ref>/eval/<input-dir>/<fixture-stem>/
   metrics/at3rs_sony/
   metrics/sony_at3rs/
   metrics/sony_sony/
+```
+
+Closed-loop candidate selection writes to:
+
+```text
+output/<git-ref>/closed_loop/<input-name>/<fixture-stem>/
+  encoded/<variant>.at3
+  decoded/<variant>_sony.wav
+  metrics/<variant>/
+  selected/selected.at3
+  selected/selected_sony.wav
+  selected/winner.txt
 ```
 
 The run also writes:

@@ -25,13 +25,44 @@ VARIANTS: list[tuple[str, list[str]]] = [
     ("gain_v2", ["--enable-gain-v2"]),
 ]
 
+SCORE_MODES = ("guarded-peaq", "peaq", "visqol", "snr")
 
-def candidate_score(row: dict[str, str]) -> tuple[float, float, float]:
-    """Higher is better. Prefer perceptual metrics when available."""
+
+def candidate_score(
+    row: dict[str, str],
+    mode: str,
+    best_snr: float | None = None,
+    best_visqol: float | None = None,
+    snr_tolerance_db: float = 0.50,
+    visqol_tolerance: float = 0.03,
+) -> tuple[float, float, float]:
+    """Higher is better."""
     peaq = parse_float(row.get("peaq_odg", ""))
     visqol = parse_float(row.get("visqol_moslqo", ""))
     snr = parse_float(row.get("gain_adjusted_snr_db", ""))
-    return (peaq if peaq is not None else -99.0, visqol if visqol is not None else -99.0, snr)
+    peaq_score = peaq if peaq is not None else -99.0
+    visqol_score = visqol if visqol is not None else -99.0
+    snr_score = snr if snr is not None else -99.0
+
+    if mode == "peaq":
+        return (peaq_score, visqol_score, snr_score)
+    if mode == "visqol":
+        return (visqol_score, peaq_score, snr_score)
+    if mode == "snr":
+        return (snr_score, peaq_score, visqol_score)
+    if mode == "guarded-peaq":
+        if peaq is None and visqol is None:
+            return (snr_score, -99.0, -99.0)
+        if best_snr is not None and snr is not None and snr < best_snr - snr_tolerance_db:
+            return (-100.0, peaq_score, visqol_score)
+        if (
+            best_visqol is not None
+            and visqol is not None
+            and visqol < best_visqol - visqol_tolerance
+        ):
+            return (-100.0, peaq_score, snr_score)
+        return (peaq_score, visqol_score, snr_score)
+    raise ValueError(f"unknown score mode: {mode}")
 
 
 def parse_float(value: str | None) -> float | None:
@@ -41,6 +72,11 @@ def parse_float(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def best_metric(rows: list[dict[str, str]], metric: str) -> float | None:
+    values = [parse_float(row[metric]) for row in rows]
+    return max((value for value in values if value is not None), default=None)
 
 
 def evaluate_variant(
@@ -144,6 +180,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tools-dir", type=Path)
     parser.add_argument("--visqol-model", type=Path)
     parser.add_argument("--skip-perceptual", action="store_true")
+    parser.add_argument(
+        "--score-mode",
+        choices=SCORE_MODES,
+        default="guarded-peaq",
+        help="Candidate selection policy. guarded-peaq rejects PEAQ wins that regress SNR/ViSQOL too far.",
+    )
+    parser.add_argument(
+        "--snr-tolerance-db",
+        type=float,
+        default=0.50,
+        help="SNR drop allowed by guarded-peaq relative to the best candidate.",
+    )
+    parser.add_argument(
+        "--visqol-tolerance",
+        type=float,
+        default=0.03,
+        help="ViSQOL drop allowed by guarded-peaq relative to the best candidate.",
+    )
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--timeout", type=int, default=180)
     return parser.parse_args(argv)
@@ -199,22 +253,43 @@ def main(argv: list[str]) -> int:
             rows.extend(candidate_rows)
             ok_rows = [row for row in candidate_rows if row["status"] == "ok"]
             if ok_rows:
-                winner = max(ok_rows, key=candidate_score)
+                best_snr = best_metric(ok_rows, "gain_adjusted_snr_db")
+                best_visqol = best_metric(ok_rows, "visqol_moslqo")
+                winner = max(
+                    ok_rows,
+                    key=lambda row: candidate_score(
+                        row,
+                        args.score_mode,
+                        best_snr=best_snr,
+                        best_visqol=best_visqol,
+                        snr_tolerance_db=args.snr_tolerance_db,
+                        visqol_tolerance=args.visqol_tolerance,
+                    ),
+                )
                 winners.append(winner)
                 selected_dir = fixture_dir / "selected"
                 selected_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(winner["encoded_path"], selected_dir / "selected.at3")
                 shutil.copy2(winner["decoded_path"], selected_dir / "selected_sony.wav")
+                score = candidate_score(
+                    winner,
+                    args.score_mode,
+                    best_snr=best_snr,
+                    best_visqol=best_visqol,
+                    snr_tolerance_db=args.snr_tolerance_db,
+                    visqol_tolerance=args.visqol_tolerance,
+                )
                 (selected_dir / "winner.txt").write_text(
                     f"variant={winner['variant']}\n"
-                    f"score={candidate_score(winner)}\n"
+                    f"score_mode={args.score_mode}\n"
+                    f"score={score}\n"
                     f"snr_db={winner['snr_db']}\n"
                     f"gain_adjusted_snr_db={winner['gain_adjusted_snr_db']}\n"
                     f"visqol_moslqo={winner['visqol_moslqo']}\n"
                     f"peaq_odg={winner['peaq_odg']}\n",
                     encoding="utf-8",
                 )
-                run_eval.log(f"{wav.name}: winner {winner['variant']} score={candidate_score(winner)}")
+                run_eval.log(f"{wav.name}: winner {winner['variant']} score={score}")
 
         fieldnames = [
             "input",
