@@ -1106,6 +1106,15 @@ impl Atrac3Context {
             filtered[idx] = self.median3_at(&rms, idx);
         }
 
+        let mut sorted = filtered;
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let floor = sorted[7].max(1.0e-7);
+        let baseline = sorted[15].max(floor);
+        let peak = sorted[31];
+        if peak < 2.0e-4 || peak / baseline < 4.0 {
+            return Vec::new();
+        }
+
         let mut sf_level = [ATRAC3_GAIN_NEUTRAL_LEVEL; 32];
         for idx in 0..32 {
             sf_level[idx] = self.relation_to_gain_idx(filtered[idx] / target);
@@ -1132,7 +1141,7 @@ impl Atrac3Context {
             let loc = sf + 1;
             let delta = level.abs_diff(prev);
             let score = self.boundary_transient_score(&filtered, loc, 3);
-            if loc == target_sf || delta >= 2 || score >= 1.9 {
+            if (delta >= 2 && score >= 2.2) || delta >= 3 {
                 transitions.push((loc, level, delta));
                 prev = level;
             }
