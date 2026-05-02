@@ -6,7 +6,7 @@ use crate::atrac3::Atrac3Context;
 use crate::riff::{read_pcm_wav, write_at3_riff, LoopPoints, WavPcm};
 use crate::ATRAC3_SAMPLES_PER_FRAME;
 
-pub use crate::atrac3::config::EncoderConfig;
+pub use crate::atrac3::config::{EncoderConfig, EncoderQuality};
 
 /// Options for encoding PCM WAV input into RIFF/WAVE ATRAC3.
 #[derive(Clone, Debug)]

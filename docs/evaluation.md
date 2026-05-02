@@ -99,6 +99,16 @@ fall more than `--snr-tolerance-db` or `--visqol-tolerance` behind the best
 candidate for that fixture. Use `--score-mode peaq`, `visqol`, or `snr` to make
 the tradeoff explicit.
 
+The current conservative high-quality CLI preset is:
+
+```sh
+cargo run --release -- -e fixtures/billiejean_30s.wav output/billiejean_high.at3 132 --quality high
+```
+
+This enables tightened gain-control detection only. Tonal-component coding and
+analysis-scale variants remain in the closed-loop evaluator because they are
+useful for some fixtures but regress others.
+
 Use an explicit tools directory:
 
 ```sh

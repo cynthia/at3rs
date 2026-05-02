@@ -49,6 +49,16 @@ Encode one WAV:
 cargo run --release -- -e fixtures/test.wav output/test.at3 132
 ```
 
+Encode with the conservative high-quality preset:
+
+```sh
+cargo run --release -- -e fixtures/test.wav output/test.at3 132 --quality high
+```
+
+`--quality high` currently enables the tightened gain-control candidate path. It
+does not enable tonal-component coding or analysis-scale changes; those remain
+closed-loop evaluation candidates because they are strongly content-dependent.
+
 Run the encoder/decoder comparison matrix for every WAV in `fixtures/`:
 
 ```sh
@@ -69,4 +79,4 @@ See [docs/evaluation.md](docs/evaluation.md) for the evaluation workflow, depend
 
 The crate is marked `publish = false` while the bitstream quality work is still moving, but the supported in-repo API is `at3rs::Encoder` with `EncodeOptions` and `EncoderConfig`. WAV parsing and ATRAC3 RIFF writing live in `at3rs::riff`; `main.rs` is only a CLI wrapper.
 
-Encoder tuning is explicit. The CLI exposes the supported knobs as flags such as `--force-clc`, `--enable-gain-v2`, `--enable-tonal-components`, `--analysis-scale`, and `--ath-gate-scale`; the encoder no longer reads a broad set of hidden tuning environment variables.
+Encoder tuning is explicit. The CLI exposes the supported knobs as flags such as `--quality`, `--force-clc`, `--enable-gain-v2`, `--enable-tonal-components`, `--analysis-scale`, and `--ath-gate-scale`; the encoder no longer reads a broad set of hidden tuning environment variables.

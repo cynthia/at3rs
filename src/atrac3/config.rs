@@ -3,6 +3,12 @@
 /// Defaults are deterministic and do not read environment variables. The
 /// builder methods below are the supported controls; additional crate-visible
 /// fields are reserved for in-tree experiments while quality work is ongoing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncoderQuality {
+    Standard,
+    High,
+}
+
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
     pub(crate) stage_debug: bool,
@@ -30,6 +36,17 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
+    /// Apply a named quality preset.
+    pub fn with_quality(mut self, quality: EncoderQuality) -> Self {
+        match quality {
+            EncoderQuality::Standard => {}
+            EncoderQuality::High => {
+                self.experimental_gain_v2 = true;
+            }
+        }
+        self
+    }
+
     /// Enable per-frame debug logging from the encoder pipeline.
     pub fn with_stage_debug(mut self, enabled: bool) -> Self {
         self.stage_debug = enabled;

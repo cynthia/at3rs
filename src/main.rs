@@ -2,7 +2,7 @@ use std::env;
 use std::io;
 
 use at3rs::atrac3::Atrac3Context;
-use at3rs::encoder::{EncodeOptions, Encoder, EncoderConfig};
+use at3rs::encoder::{EncodeOptions, Encoder, EncoderConfig, EncoderQuality};
 use at3rs::riff::{read_atrac3_riff, write_pcm_wav, LoopPoints};
 use at3rs::ATRAC3_SAMPLES_PER_FRAME;
 
@@ -45,6 +45,7 @@ fn print_usage() {
     println!("  --max-frames <n>            encode at most n ATRAC3 frames");
     println!("  --force-clc                 disable VLC and write fixed-length mantissas");
     println!("  --disable-vlc               alias for --force-clc");
+    println!("  --quality <standard|high>   apply a named encoder quality preset");
     println!("  --enable-gain-v2            enable experimental gain-control syntax");
     println!("  --enable-tonal-components   enable experimental tonal-component syntax");
     println!("  --stage-debug               print encoder stage diagnostics");
@@ -117,6 +118,13 @@ fn parse_encode_options(args: &[String]) -> io::Result<EncodeOptions> {
                 config = config.with_force_clc(true);
                 idx += 1;
             }
+            "--quality" => {
+                if idx + 1 >= args.len() {
+                    return Err(invalid_input("expected --quality <standard|high>"));
+                }
+                config = config.with_quality(parse_quality(&args[idx + 1])?);
+                idx += 2;
+            }
             "--enable-gain-v2" => {
                 config = config.with_experimental_gain_v2(true);
                 idx += 1;
@@ -185,6 +193,14 @@ fn parse_positive_f32(value: &str, message: &'static str) -> io::Result<f32> {
         .ok()
         .filter(|parsed| *parsed > 0.0)
         .ok_or_else(|| invalid_input(message))
+}
+
+fn parse_quality(value: &str) -> io::Result<EncoderQuality> {
+    match value {
+        "standard" => Ok(EncoderQuality::Standard),
+        "high" => Ok(EncoderQuality::High),
+        _ => Err(invalid_input("invalid quality preset")),
+    }
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
