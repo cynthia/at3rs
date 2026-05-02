@@ -17,12 +17,19 @@ REPO_ROOT = run_eval.REPO_ROOT
 VARIANTS: list[tuple[str, list[str]]] = [
     ("default", []),
     ("analysis_0.225", ["--analysis-scale", "0.225"]),
+    ("analysis_0.235", ["--analysis-scale", "0.235"]),
     ("analysis_0.245", ["--analysis-scale", "0.245"]),
     ("ath_0.00005", ["--ath-gate-scale", "0.00005"]),
     ("ath_0.00020", ["--ath-gate-scale", "0.00020"]),
     ("force_clc", ["--force-clc"]),
     ("tonal", ["--enable-tonal-components"]),
     ("gain_v2", ["--enable-gain-v2"]),
+    ("analysis_0.225_tonal", ["--analysis-scale", "0.225", "--enable-tonal-components"]),
+    ("analysis_0.235_tonal", ["--analysis-scale", "0.235", "--enable-tonal-components"]),
+    ("analysis_0.245_tonal", ["--analysis-scale", "0.245", "--enable-tonal-components"]),
+    ("analysis_0.225_gain_v2", ["--analysis-scale", "0.225", "--enable-gain-v2"]),
+    ("analysis_0.235_gain_v2", ["--analysis-scale", "0.235", "--enable-gain-v2"]),
+    ("analysis_0.245_gain_v2", ["--analysis-scale", "0.245", "--enable-gain-v2"]),
 ]
 
 SCORE_MODES = ("guarded-peaq", "peaq", "visqol", "snr")
