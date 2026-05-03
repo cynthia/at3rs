@@ -42,6 +42,8 @@ impl EncoderConfig {
             EncoderQuality::Standard => {}
             EncoderQuality::High => {
                 self.experimental_gain_v2 = true;
+                self.analysis_scale = 0.205;
+                self.vlc_bit_safety = 8;
             }
         }
         self
