@@ -32,10 +32,12 @@ MATRIX_CELLS = [
 ]
 AT3RS_ONLY_CELLS = [("at3rs", "at3rs"), ("at3rs", "sony")]
 ENCODER_QUALITY_CELLS = [("at3rs", "sony"), ("foss", "sony"), ("sony", "sony")]
+ENCODER_QUALITY_OPUS_CELL = ("opus", "opus")
 CELL_COLORS = {
     "at3rs->at3rs": "#0969da",
     "at3rs->sony": "#8250df",
     "foss->sony": "#1a7f37",
+    "opus->opus": "#d1242f",
     "sony->at3rs": "#bf8700",
     "sony->sony": "#cf222e",
 }
@@ -231,6 +233,13 @@ def foss_bitrate_arg(bitrate_kbps: int) -> str:
         132: 129,
     }
     return str(sony_to_foss.get(bitrate_kbps, bitrate_kbps))
+
+
+def resolve_ffmpeg() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise EvalError("ffmpeg is required for Opus comparison but was not found in PATH")
+    return ffmpeg
 
 
 def parse_snr(output: str) -> dict[str, str]:
@@ -714,6 +723,7 @@ def evaluate_fixture(
     skip_perceptual: bool,
     include_sony_reference: bool,
     encoder_quality_only: bool,
+    include_opus: bool,
     at3rs_quality: str,
     timeout: int,
 ) -> list[dict[str, str]]:
@@ -729,11 +739,14 @@ def evaluate_fixture(
             stale_metric.unlink()
 
     if encoder_quality_only:
-        cells = ENCODER_QUALITY_CELLS
+        cells = ENCODER_QUALITY_CELLS.copy()
+        if include_opus:
+            cells.append(ENCODER_QUALITY_OPUS_CELL)
     else:
         cells = MATRIX_CELLS if include_sony_reference else AT3RS_ONLY_CELLS
     rows = []
     for encoder, decoder in cells:
+        encoded_ext = ".opus" if encoder == "opus" else ".at3"
         rows.append(
             evaluate_round_trip(
                 wav,
@@ -741,7 +754,7 @@ def evaluate_fixture(
                 total,
                 encoder,
                 decoder,
-                encoded_dir / f"{encoder}.at3",
+                encoded_dir / f"{encoder}{encoded_ext}",
                 decoded_dir / f"{encoder}_{decoder}.wav",
                 metrics_root / f"{encoder}_{decoder}",
                 bitrate,
@@ -835,6 +848,26 @@ def evaluate_round_trip(
                 ],
                 timeout=timeout,
             )
+        elif encoder == "opus":
+            ffmpeg = resolve_ffmpeg()
+            encode = checked_command(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(wav),
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    f"{bitrate}k",
+                    "-vbr",
+                    "on",
+                    str(encoded_at3),
+                ],
+                timeout=timeout,
+            )
         else:
             raise EvalError(f"unsupported encoder: {encoder}")
         (metrics_dir / "encode.txt").write_text(encode.stdout, encoding="utf-8")
@@ -849,6 +882,24 @@ def evaluate_round_trip(
             decode = checked_command(
                 [str(wine), str(sony_tool), "-d", str(encoded_at3), str(decoded_wav)],
                 env=wine_env,
+                timeout=timeout,
+            )
+        elif decoder == "opus":
+            ffmpeg = resolve_ffmpeg()
+            decode = checked_command(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(encoded_at3),
+                    "-ar",
+                    "44100",
+                    "-acodec",
+                    "pcm_s16le",
+                    str(decoded_wav),
+                ],
                 timeout=timeout,
             )
         else:
@@ -934,6 +985,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="compare at3rs, FOSS atracdenc, and Sony encoders using Sony decode for all outputs",
     )
+    parser.add_argument(
+        "--include-opus",
+        action="store_true",
+        help="add an Opus round-trip cell encoded with ffmpeg at the same nominal bitrate",
+    )
     parser.add_argument("--no-build", action="store_true", help="do not build release tools first")
     parser.add_argument("--timeout", type=int, default=180, help="per-command timeout in seconds")
     parser.add_argument(
@@ -979,6 +1035,7 @@ def run_fixture_evals(
                 args.skip_perceptual,
                 not args.no_sony_reference,
                 args.encoder_quality_only,
+                args.include_opus,
                 args.at3rs_quality,
                 args.timeout,
             )
@@ -1004,6 +1061,7 @@ def run_fixture_evals(
                 args.skip_perceptual,
                 not args.no_sony_reference,
                 args.encoder_quality_only,
+                args.include_opus,
                 args.at3rs_quality,
                 args.timeout,
             ): index
@@ -1021,11 +1079,15 @@ def main(argv: list[str]) -> int:
     try:
         input_dir = args.input_dir.resolve()
         wavs = discover_wav_files(input_dir)
+        if args.include_opus and not args.encoder_quality_only:
+            raise EvalError("--include-opus requires --encoder-quality-only")
         if not args.sony_tool.exists():
             raise EvalError(f"Sony PSP decoder not found: {args.sony_tool}")
         build_release_tools(args.no_build, args.timeout)
         wine, wine_env = resolve_wine()
         foss_encoder = resolve_foss_encoder(args.foss_encoder) if args.encoder_quality_only else None
+        if args.include_opus:
+            resolve_ffmpeg()
         tools_dir = resolve_tools_dir(args.tools_dir) if not args.skip_perceptual else Path("")
         visqol_model = (
             resolve_visqol_model(args.visqol_model, tools_dir) if not args.skip_perceptual else None
@@ -1041,6 +1103,7 @@ def main(argv: list[str]) -> int:
         log(f"sony reference: {'enabled' if args.encoder_quality_only else ('disabled' if args.no_sony_reference else 'enabled')}")
         if foss_encoder:
             log(f"foss encoder: {foss_encoder}")
+        log(f"opus comparison: {'enabled' if args.include_opus else 'disabled'}")
         log(f"at3rs quality: {args.at3rs_quality}")
         log(f"jobs: {min(args.jobs, len(wavs))}")
         log(f"output: {output_dir}")
@@ -1055,6 +1118,7 @@ def main(argv: list[str]) -> int:
             "sony_tool": str(args.sony_tool),
             "wine": str(wine),
             "foss_encoder": str(foss_encoder) if foss_encoder else "",
+            "opus_comparison": "enabled" if args.include_opus else "disabled",
             "tools_dir": str(tools_dir) if tools_dir else "skipped",
             "visqol_model": str(visqol_model) if visqol_model else "",
             "mode": "encoder_quality" if args.encoder_quality_only else "full_matrix",

@@ -109,6 +109,16 @@ Use the current high-quality at3rs preset in that comparison:
 python3 eval/run_eval.py fixtures --encoder-quality-only --at3rs-quality high --jobs 4
 ```
 
+Add Opus at the same nominal bitrate:
+
+```sh
+python3 eval/run_eval.py fixtures --encoder-quality-only --include-opus --at3rs-quality high --jobs 4
+```
+
+The Opus cell is `opus -> opus` through ffmpeg/libopus, not Sony decode. It is a
+modern-codec round-trip reference point, while the ATRAC3 cells stay decoded by
+Sony for a common ATRAC3 decoder.
+
 Run closed-loop candidate selection for a fixture:
 
 ```sh
