@@ -1141,7 +1141,7 @@ impl Atrac3Context {
             let loc = sf + 1;
             let delta = level.abs_diff(prev);
             let score = self.boundary_transient_score(&filtered, loc, 3);
-            if (delta >= 2 && score >= 2.2) || delta >= 3 {
+            if (delta == 1 && score >= 2.4) || (delta >= 2 && score >= 1.8) || delta >= 3 {
                 transitions.push((loc, level, delta));
                 prev = level;
             }
