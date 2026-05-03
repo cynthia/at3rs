@@ -31,9 +31,11 @@ MATRIX_CELLS = [
     ("sony", "sony"),
 ]
 AT3RS_ONLY_CELLS = [("at3rs", "at3rs"), ("at3rs", "sony")]
+ENCODER_QUALITY_CELLS = [("at3rs", "sony"), ("foss", "sony"), ("sony", "sony")]
 CELL_COLORS = {
     "at3rs->at3rs": "#0969da",
     "at3rs->sony": "#8250df",
+    "foss->sony": "#1a7f37",
     "sony->at3rs": "#bf8700",
     "sony->sony": "#cf222e",
 }
@@ -202,6 +204,33 @@ def resolve_visqol_model(explicit: Path | None, tools_dir: Path) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def resolve_foss_encoder(explicit: Path | None) -> Path:
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend(
+        [
+            REPO_ROOT.parent / "reference" / "atracdenc" / "build" / "src" / "atracdenc",
+            REPO_ROOT.parent / "vendor" / "atracdenc" / "build" / "src" / "atracdenc",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return candidate
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise EvalError(f"FOSS atracdenc encoder not found or not executable: {searched}")
+
+
+def foss_bitrate_arg(bitrate_kbps: int) -> str:
+    """atracdenc multiplies this value by 1024 before choosing a mode."""
+    sony_to_foss = {
+        66: 64,
+        105: 102,
+        132: 129,
+    }
+    return str(sony_to_foss.get(bitrate_kbps, bitrate_kbps))
 
 
 def parse_snr(output: str) -> dict[str, str]:
@@ -679,10 +708,13 @@ def evaluate_fixture(
     wine: Path,
     wine_env: dict[str, str],
     sony_tool: Path,
+    foss_encoder: Path | None,
     tools_dir: Path,
     visqol_model: Path | None,
     skip_perceptual: bool,
     include_sony_reference: bool,
+    encoder_quality_only: bool,
+    at3rs_quality: str,
     timeout: int,
 ) -> list[dict[str, str]]:
     stem_dir = output_dir / wav.stem
@@ -696,7 +728,10 @@ def evaluate_fixture(
         if stale_metric.is_file():
             stale_metric.unlink()
 
-    cells = MATRIX_CELLS if include_sony_reference else AT3RS_ONLY_CELLS
+    if encoder_quality_only:
+        cells = ENCODER_QUALITY_CELLS
+    else:
+        cells = MATRIX_CELLS if include_sony_reference else AT3RS_ONLY_CELLS
     rows = []
     for encoder, decoder in cells:
         rows.append(
@@ -713,9 +748,11 @@ def evaluate_fixture(
                 wine,
                 wine_env,
                 sony_tool,
+                foss_encoder,
                 tools_dir,
                 visqol_model,
                 skip_perceptual,
+                at3rs_quality,
                 timeout,
             )
         )
@@ -736,9 +773,11 @@ def evaluate_round_trip(
     wine: Path,
     wine_env: dict[str, str],
     sony_tool: Path,
+    foss_encoder: Path | None,
     tools_dir: Path,
     visqol_model: Path | None,
     skip_perceptual: bool,
+    at3rs_quality: str,
     timeout: int,
 ) -> dict[str, str]:
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -752,14 +791,17 @@ def evaluate_round_trip(
     try:
         log(f"{prefix}: encode")
         if encoder == "at3rs":
+            at3rs_args = [
+                str(REPO_ROOT / "target" / "release" / "at3rs"),
+                "-e",
+                str(wav),
+                str(encoded_at3),
+                str(bitrate),
+            ]
+            if at3rs_quality != "standard":
+                at3rs_args.extend(["--quality", at3rs_quality])
             encode = checked_command(
-                [
-                    str(REPO_ROOT / "target" / "release" / "at3rs"),
-                    "-e",
-                    str(wav),
-                    str(encoded_at3),
-                    str(bitrate),
-                ],
+                at3rs_args,
                 timeout=timeout,
             )
         elif encoder == "sony":
@@ -774,6 +816,23 @@ def evaluate_round_trip(
                     str(encoded_at3),
                 ],
                 env=wine_env,
+                timeout=timeout,
+            )
+        elif encoder == "foss":
+            if foss_encoder is None:
+                raise EvalError("FOSS atracdenc encoder was not configured")
+            encode = checked_command(
+                [
+                    str(foss_encoder),
+                    "-e",
+                    "atrac3",
+                    "-i",
+                    str(wav),
+                    "-o",
+                    str(encoded_at3),
+                    "--bitrate",
+                    foss_bitrate_arg(bitrate),
+                ],
                 timeout=timeout,
             )
         else:
@@ -855,6 +914,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bitrate", type=int, default=132, help="ATRAC3 bitrate in kbps")
     parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "output", help="output directory root")
     parser.add_argument("--sony-tool", type=Path, default=DEFAULT_SONY_TOOL, help="path to psp_at3tool.exe")
+    parser.add_argument("--foss-encoder", type=Path, help="path to atracdenc for FOSS encoder comparison")
+    parser.add_argument(
+        "--at3rs-quality",
+        choices=("standard", "high"),
+        default="standard",
+        help="quality preset to use for at3rs encode cells",
+    )
     parser.add_argument("--tools-dir", type=Path, help="directory containing visqol and PQevalAudio")
     parser.add_argument("--visqol-model", type=Path, help="optional ViSQOL model file")
     parser.add_argument("--skip-perceptual", action="store_true", help="skip ViSQOL and PEAQ")
@@ -862,6 +928,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--no-sony-reference",
         action="store_true",
         help="skip Sony reference encode; run at3rs encode with at3rs and Sony decode",
+    )
+    parser.add_argument(
+        "--encoder-quality-only",
+        action="store_true",
+        help="compare at3rs, FOSS atracdenc, and Sony encoders using Sony decode for all outputs",
     )
     parser.add_argument("--no-build", action="store_true", help="do not build release tools first")
     parser.add_argument("--timeout", type=int, default=180, help="per-command timeout in seconds")
@@ -880,6 +951,7 @@ def run_fixture_evals(
     args: argparse.Namespace,
     wine: Path,
     wine_env: dict[str, str],
+    foss_encoder: Path | None,
     tools_dir: Path,
     visqol_model: Path | None,
 ) -> list[dict[str, str]]:
@@ -901,10 +973,13 @@ def run_fixture_evals(
                 wine,
                 wine_env,
                 args.sony_tool,
+                foss_encoder,
                 tools_dir,
                 visqol_model,
                 args.skip_perceptual,
                 not args.no_sony_reference,
+                args.encoder_quality_only,
+                args.at3rs_quality,
                 args.timeout,
             )
         ]
@@ -923,10 +998,13 @@ def run_fixture_evals(
                 wine,
                 wine_env,
                 args.sony_tool,
+                foss_encoder,
                 tools_dir,
                 visqol_model,
                 args.skip_perceptual,
                 not args.no_sony_reference,
+                args.encoder_quality_only,
+                args.at3rs_quality,
                 args.timeout,
             ): index
             for index, wav in enumerate(wavs, start=1)
@@ -947,6 +1025,7 @@ def main(argv: list[str]) -> int:
             raise EvalError(f"Sony PSP decoder not found: {args.sony_tool}")
         build_release_tools(args.no_build, args.timeout)
         wine, wine_env = resolve_wine()
+        foss_encoder = resolve_foss_encoder(args.foss_encoder) if args.encoder_quality_only else None
         tools_dir = resolve_tools_dir(args.tools_dir) if not args.skip_perceptual else Path("")
         visqol_model = (
             resolve_visqol_model(args.visqol_model, tools_dir) if not args.skip_perceptual else None
@@ -954,9 +1033,15 @@ def main(argv: list[str]) -> int:
 
         ref = git_ref_slug()
         output_dir = args.output_root / ref / "eval" / input_dir.name
+        if args.encoder_quality_only:
+            output_dir = args.output_root / ref / "encoder_quality" / input_dir.name
         output_dir.mkdir(parents=True, exist_ok=True)
         log(f"evaluating {len(wavs)} WAV fixture(s)")
-        log(f"sony reference: {'disabled' if args.no_sony_reference else 'enabled'}")
+        log(f"mode: {'encoder quality' if args.encoder_quality_only else 'full matrix'}")
+        log(f"sony reference: {'enabled' if args.encoder_quality_only else ('disabled' if args.no_sony_reference else 'enabled')}")
+        if foss_encoder:
+            log(f"foss encoder: {foss_encoder}")
+        log(f"at3rs quality: {args.at3rs_quality}")
         log(f"jobs: {min(args.jobs, len(wavs))}")
         log(f"output: {output_dir}")
 
@@ -966,16 +1051,21 @@ def main(argv: list[str]) -> int:
             "git_head": git_head(),
             "input_dir": str(input_dir),
             "bitrate_kbps": str(args.bitrate),
+            "at3rs_quality": args.at3rs_quality,
             "sony_tool": str(args.sony_tool),
             "wine": str(wine),
+            "foss_encoder": str(foss_encoder) if foss_encoder else "",
             "tools_dir": str(tools_dir) if tools_dir else "skipped",
             "visqol_model": str(visqol_model) if visqol_model else "",
-            "sony_reference": "disabled" if args.no_sony_reference else "enabled",
+            "mode": "encoder_quality" if args.encoder_quality_only else "full_matrix",
+            "sony_reference": "enabled" if args.encoder_quality_only else ("disabled" if args.no_sony_reference else "enabled"),
             "jobs": str(min(args.jobs, len(wavs))),
         }
         (output_dir / "_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
-        rows = run_fixture_evals(wavs, output_dir, args, wine, wine_env, tools_dir, visqol_model)
+        rows = run_fixture_evals(
+            wavs, output_dir, args, wine, wine_env, foss_encoder, tools_dir, visqol_model
+        )
 
         summary_path = output_dir / "summary.csv"
         fieldnames = list(rows[0].keys())

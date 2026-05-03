@@ -12,6 +12,12 @@ Generated evaluation artifacts are written to:
 output/<git-ref>/eval/<input-directory-name>/
 ```
 
+Encoder-quality-only reports are written to:
+
+```text
+output/<git-ref>/encoder_quality/<input-directory-name>/
+```
+
 The git ref slug includes a dirty marker when the working tree has uncommitted changes, so listening samples and metric reports can be tied back to the code state that produced them.
 
 ## Dependencies
@@ -83,6 +89,24 @@ Run only the at3rs encode paths:
 
 ```sh
 python3 eval/run_eval.py fixtures --no-sony-reference
+```
+
+Compare encoder quality with a common Sony decoder:
+
+```sh
+python3 eval/run_eval.py fixtures --encoder-quality-only --jobs 4
+```
+
+This produces `at3rs -> sony`, `foss -> sony`, and `sony -> sony` rows. The FOSS
+encoder is `atracdenc`; by default the runner looks for
+`../reference/atracdenc/build/src/atracdenc`, or use `--foss-encoder <path>`.
+This is the fairest current encode-quality comparison because FOSS does not
+provide an ATRAC3 decoder and the at3rs decoder is diagnostic-only.
+
+Use the current high-quality at3rs preset in that comparison:
+
+```sh
+python3 eval/run_eval.py fixtures --encoder-quality-only --at3rs-quality high --jobs 4
 ```
 
 Run closed-loop candidate selection for a fixture:
