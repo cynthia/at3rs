@@ -74,10 +74,38 @@ def encode_foss(wav: Path, out_at3: Path, bitrate: int, foss_encoder: Path, time
     (out_at3.parent / "foss_encode.txt").write_text(proc.stdout, encoding="utf-8")
 
 
-def parse_dump(output: str, encoder: str, frame: int) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for line in output.splitlines():
+def parse_sf_idx_values(text: str) -> list[str]:
+    values: list[str] = []
+    body = text.strip()
+    if not (body.startswith("[") and body.endswith("]")):
+        return values
+    for item in body[1:-1].split(","):
+        item = item.strip()
+        if not item or item == "None":
+            values.append("")
+            continue
+        match = re.fullmatch(r"Some\((\d+)\)", item)
+        values.append(match.group(1) if match else item)
+    return values
+
+
+def parse_dump(output: str, encoder: str, frame: int) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    gain_rows: list[dict[str, str]] = []
+    allocation_rows: list[dict[str, str]] = []
+    current_channel: dict[str, str] | None = None
+    lines = output.splitlines()
+    for line in lines:
         if not line.startswith("ch ") or " num_bfu=" not in line:
+            if current_channel and line.startswith("selectors="):
+                selectors = ast.literal_eval(line.removeprefix("selectors="))
+                current_channel["selectors"] = " ".join(str(v) for v in selectors)
+                current_channel["coded_bfu"] = str(sum(1 for v in selectors if v != 0))
+                current_channel["max_selector"] = str(max(selectors, default=0))
+            elif current_channel and line.startswith("sf_idx="):
+                sf_idx = parse_sf_idx_values(line.removeprefix("sf_idx="))
+                current_channel["sf_idx"] = " ".join(sf_idx)
+                allocation_rows.append(current_channel)
+                current_channel = None
             continue
         match = re.search(r"ch (\d+).*gains=(\[.*?\]) num_bfu=(\d+) coding_mode=(\d+)", line)
         if not match:
@@ -86,8 +114,19 @@ def parse_dump(output: str, encoder: str, frame: int) -> list[dict[str, str]]:
         gains = ast.literal_eval(match.group(2))
         num_bfu = match.group(3)
         coding_mode = match.group(4)
+        current_channel = {
+            "encoder": encoder,
+            "frame": str(frame),
+            "channel": str(ch),
+            "num_bfu": num_bfu,
+            "coded_bfu": "",
+            "max_selector": "",
+            "coding_mode": coding_mode,
+            "selectors": "",
+            "sf_idx": "",
+        }
         for band, points in enumerate(gains):
-            rows.append(
+            gain_rows.append(
                 {
                     "encoder": encoder,
                     "frame": str(frame),
@@ -99,12 +138,15 @@ def parse_dump(output: str, encoder: str, frame: int) -> list[dict[str, str]]:
                     "coding_mode": coding_mode,
                 }
             )
-    return rows
+    return gain_rows, allocation_rows
 
 
-def dump_gain_rows(at3: Path, encoder: str, block_align: int, timeout: int) -> list[dict[str, str]]:
+def dump_rows(
+    at3: Path, encoder: str, block_align: int, timeout: int
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     frame_count = data_chunk_size(at3) // block_align
-    rows: list[dict[str, str]] = []
+    gain_rows: list[dict[str, str]] = []
+    allocation_rows: list[dict[str, str]] = []
     for frame in range(frame_count):
         proc = run_eval.checked_command(
             [
@@ -115,8 +157,10 @@ def dump_gain_rows(at3: Path, encoder: str, block_align: int, timeout: int) -> l
             ],
             timeout=timeout,
         )
-        rows.extend(parse_dump(proc.stdout, encoder, frame))
-    return rows
+        frame_gain_rows, frame_allocation_rows = parse_dump(proc.stdout, encoder, frame)
+        gain_rows.extend(frame_gain_rows)
+        allocation_rows.extend(frame_allocation_rows)
+    return gain_rows, allocation_rows
 
 
 def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
@@ -158,7 +202,52 @@ def build_diff_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return diff_rows
 
 
-def write_summary(path: Path, rows: list[dict[str, str]], diff_rows: list[dict[str, str]]) -> None:
+def build_allocation_diff_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    grouped: dict[tuple[str, str], dict[str, dict[str, str]]] = {}
+    for row in rows:
+        key = (row["frame"], row["channel"])
+        grouped.setdefault(key, {})[row["encoder"]] = row
+
+    diff_rows = []
+    for (frame, channel), by_encoder in sorted(
+        grouped.items(), key=lambda item: tuple(int(v) for v in item[0])
+    ):
+        at3rs = by_encoder.get("at3rs", {})
+        foss = by_encoder.get("foss", {})
+        changed = any(
+            at3rs.get(field, "") != foss.get(field, "")
+            for field in ("num_bfu", "coded_bfu", "max_selector", "coding_mode", "selectors", "sf_idx")
+        )
+        if not changed:
+            continue
+        diff_rows.append(
+            {
+                "frame": frame,
+                "channel": channel,
+                "at3rs_num_bfu": at3rs.get("num_bfu", ""),
+                "foss_num_bfu": foss.get("num_bfu", ""),
+                "at3rs_coded_bfu": at3rs.get("coded_bfu", ""),
+                "foss_coded_bfu": foss.get("coded_bfu", ""),
+                "at3rs_max_selector": at3rs.get("max_selector", ""),
+                "foss_max_selector": foss.get("max_selector", ""),
+                "at3rs_coding_mode": at3rs.get("coding_mode", ""),
+                "foss_coding_mode": foss.get("coding_mode", ""),
+                "at3rs_selectors": at3rs.get("selectors", ""),
+                "foss_selectors": foss.get("selectors", ""),
+                "at3rs_sf_idx": at3rs.get("sf_idx", ""),
+                "foss_sf_idx": foss.get("sf_idx", ""),
+            }
+        )
+    return diff_rows
+
+
+def write_summary(
+    path: Path,
+    rows: list[dict[str, str]],
+    diff_rows: list[dict[str, str]],
+    allocation_rows: list[dict[str, str]],
+    allocation_diff_rows: list[dict[str, str]],
+) -> None:
     totals: dict[tuple[str, str], int] = {}
     frame_bands: dict[str, set[tuple[str, str, str]]] = {}
     for row in rows:
@@ -183,6 +272,35 @@ def write_summary(path: Path, rows: list[dict[str, str]], diff_rows: list[dict[s
         lines.append(
             f"- frame {row['frame']} ch {row['channel']} band {row['band']}: "
             f"at3rs=[{row['at3rs_points']}] foss=[{row['foss_points']}]"
+        )
+    lines.extend(
+        [
+            "",
+            "Allocation summary:",
+        ]
+    )
+    for encoder in ("at3rs", "foss"):
+        enc_rows = [row for row in allocation_rows if row["encoder"] == encoder]
+        avg_num_bfu = (
+            sum(int(row["num_bfu"]) for row in enc_rows) / len(enc_rows) if enc_rows else 0.0
+        )
+        avg_coded_bfu = (
+            sum(int(row["coded_bfu"]) for row in enc_rows) / len(enc_rows) if enc_rows else 0.0
+        )
+        clc_rows = sum(1 for row in enc_rows if row["coding_mode"] == "1")
+        lines.append(
+            f"- {encoder}: avg_num_bfu={avg_num_bfu:.2f} "
+            f"avg_coded_bfu={avg_coded_bfu:.2f} clc_rows={clc_rows}/{len(enc_rows)}"
+        )
+    lines.append(f"- allocation mismatched frame/channel rows: {len(allocation_diff_rows)}")
+    lines.append("")
+    lines.append("Top allocation mismatches:")
+    for row in allocation_diff_rows[:10]:
+        lines.append(
+            f"- frame {row['frame']} ch {row['channel']}: "
+            f"num_bfu {row['at3rs_num_bfu']} vs {row['foss_num_bfu']}, "
+            f"coded_bfu {row['at3rs_coded_bfu']} vs {row['foss_coded_bfu']}, "
+            f"max_selector {row['at3rs_max_selector']} vs {row['foss_max_selector']}"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -209,9 +327,11 @@ def main(argv: list[str]) -> int:
 
         block_align = 384
         run_eval.log("dump at3rs gain points")
-        rows = dump_gain_rows(at3rs_at3, "at3rs", block_align, args.timeout)
+        rows, allocation_rows = dump_rows(at3rs_at3, "at3rs", block_align, args.timeout)
         run_eval.log("dump foss gain points")
-        rows.extend(dump_gain_rows(foss_at3, "foss", block_align, args.timeout))
+        foss_rows, foss_allocation_rows = dump_rows(foss_at3, "foss", block_align, args.timeout)
+        rows.extend(foss_rows)
+        allocation_rows.extend(foss_allocation_rows)
 
         fieldnames = [
             "encoder",
@@ -224,6 +344,21 @@ def main(argv: list[str]) -> int:
             "coding_mode",
         ]
         write_csv(out_dir / "gain_points.csv", rows, fieldnames)
+        write_csv(
+            out_dir / "allocation.csv",
+            allocation_rows,
+            [
+                "encoder",
+                "frame",
+                "channel",
+                "num_bfu",
+                "coded_bfu",
+                "max_selector",
+                "coding_mode",
+                "selectors",
+                "sf_idx",
+            ],
+        )
 
         diff_rows = build_diff_rows(rows)
         write_csv(
@@ -241,7 +376,28 @@ def main(argv: list[str]) -> int:
                 "foss_num_bfu",
             ],
         )
-        write_summary(out_dir / "summary.md", rows, diff_rows)
+        allocation_diff_rows = build_allocation_diff_rows(allocation_rows)
+        write_csv(
+            out_dir / "allocation_diffs.csv",
+            allocation_diff_rows,
+            [
+                "frame",
+                "channel",
+                "at3rs_num_bfu",
+                "foss_num_bfu",
+                "at3rs_coded_bfu",
+                "foss_coded_bfu",
+                "at3rs_max_selector",
+                "foss_max_selector",
+                "at3rs_coding_mode",
+                "foss_coding_mode",
+                "at3rs_selectors",
+                "foss_selectors",
+                "at3rs_sf_idx",
+                "foss_sf_idx",
+            ],
+        )
+        write_summary(out_dir / "summary.md", rows, diff_rows, allocation_rows, allocation_diff_rows)
         run_eval.log(f"wrote {out_dir}")
         return 0
     except Exception as exc:
