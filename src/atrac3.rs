@@ -2237,6 +2237,18 @@ impl Atrac3Context {
         plans: &mut [BfuCoding],
         budget_bits: usize,
     ) {
+        // Sony/FOSS encoders tend to keep the last QMF band-2 BFU alive when it
+        // has signal. Dropping it measured as a large perceptual regression on
+        // music fixtures even when scalar SNR changed only slightly.
+        if let Some(plan) = plans.get_mut(29) {
+            if plan.table_idx == 0 && plan.max_val >= 1.0e-7 {
+                plan.table_idx = 1;
+                let start = ATRAC3_SUBBAND_TAB[plan.block];
+                let end = ATRAC3_SUBBAND_TAB[plan.block + 1];
+                self.refresh_bfu_plan(&spectrum[start..end], plan);
+            }
+        }
+
         for idx in 0..plans.len() {
             let target = ATRAC3_SELECTOR_SHAPE_HINT[idx] as usize;
             while target > 0 && plans[idx].table_idx > target {
