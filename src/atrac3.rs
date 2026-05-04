@@ -1111,7 +1111,7 @@ impl Atrac3Context {
         let floor = sorted[7].max(1.0e-7);
         let baseline = sorted[15].max(floor);
         let peak = sorted[31];
-        if peak < 2.0e-4 || peak / baseline < 4.0 {
+        if peak < 2.0e-4 || peak / baseline < 3.2 {
             return Vec::new();
         }
 
@@ -1141,7 +1141,7 @@ impl Atrac3Context {
             let loc = sf + 1;
             let delta = level.abs_diff(prev);
             let score = self.boundary_transient_score(&filtered, loc, 3);
-            if (delta == 1 && score >= 2.4) || (delta >= 2 && score >= 1.8) || delta >= 3 {
+            if (delta == 1 && score >= 2.1) || (delta >= 2 && score >= 1.55) || delta >= 3 {
                 transitions.push((loc, level, delta));
                 prev = level;
             }
