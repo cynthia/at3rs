@@ -1286,7 +1286,7 @@ impl Atrac3Context {
             }
             let sf_idx = self.sf_index_for_value(max_val);
             let sf = SF_TABLE[sf_idx];
-            let quant_selector = 7;
+            let quant_selector = if bfu >= 27 { 5 } else { 7 };
             let max_quant = self.selector_max_quant(quant_selector);
             let quant_limit = self.selector_quant_limit(quant_selector);
             let mantissas = spectrum[abs_pos..abs_pos + best_len]
@@ -1369,7 +1369,7 @@ impl Atrac3Context {
                 }
                 let sf_idx = self.sf_index_for_value(max_val);
                 let sf = SF_TABLE[sf_idx];
-                let quant_selector = 7;
+                let quant_selector = if bfu >= 27 { 5 } else { 7 };
                 let max_quant = self.selector_max_quant(quant_selector);
                 let quant_limit = self.selector_quant_limit(quant_selector);
                 let mantissas = spectrum[abs_pos..abs_pos + best_len]
@@ -1434,7 +1434,7 @@ impl Atrac3Context {
             return 0;
         }
 
-        let mut bits = 2;
+        let mut bits = 5 + 2;
         for group in groups {
             let mut active_spec_blocks = [false; 16];
             for component in &group {
@@ -1447,15 +1447,7 @@ impl Atrac3Context {
             let component_bits = group
                 .iter()
                 .map(|component| {
-                    let mantissa_bits = match component.quant_selector {
-                        1 => 4 * ((component.coded_values + 1) / 2),
-                        2 | 3 => 3 * component.coded_values,
-                        4 | 5 => 4 * component.coded_values,
-                        6 => 5 * component.coded_values,
-                        7 => 6 * component.coded_values,
-                        _ => 0,
-                    };
-                    6 + 6 + mantissa_bits
+                    6 + 6 + self.tonal_component_vlc_bits(component)
                 })
                 .sum::<usize>();
             bits += qmf_bands + 3 + 3 + active_qmf_bands * 4 * 3 + component_bits;
@@ -1496,6 +1488,35 @@ impl Atrac3Context {
             }
         }
         groups
+    }
+
+    fn tonal_component_vlc_bits(&self, component: &TonalComponent) -> usize {
+        if component.quant_selector == 0 {
+            return 0;
+        }
+        let vlc_table = &crate::huffman::SPECTRAL_VLC[component.quant_selector - 1];
+        if component.quant_selector == 1 {
+            component
+                .mantissas
+                .chunks(2)
+                .map(|pair| {
+                    let a = pair.first().copied().unwrap_or(0);
+                    let b = pair.get(1).copied().unwrap_or(0);
+                    let symbol = self.selector1_vlc_symbol(a, b) as usize;
+                    vlc_table.entries[symbol].len as usize
+                })
+                .sum()
+        } else {
+            component
+                .mantissas
+                .iter()
+                .take(component.coded_values)
+                .map(|&mantissa| {
+                    let symbol = self.scalar_vlc_symbol(mantissa) as usize;
+                    vlc_table.entries[symbol].len as usize
+                })
+                .sum()
+        }
     }
 
     fn remove_tonal_components_from_residual(
@@ -2593,7 +2614,7 @@ impl Atrac3Context {
         }
 
         bw.write_bits(groups.len().min(31) as u32, 5);
-        bw.write_bits(1, 2);
+        bw.write_bits(0, 2);
 
         for components in groups.iter().take(31) {
             let mut qmf_flags = vec![false; qmf_bands];
@@ -2627,27 +2648,23 @@ impl Atrac3Context {
                     {
                         bw.write_bits(component.sf_idx as u32, 6);
                         bw.write_bits((component.abs_pos % 64) as u32, 6);
-                        let mantissa_bits = match component.quant_selector {
-                            1 => 4,
-                            2 | 3 => 3,
-                            4 | 5 => 4,
-                            6 => 5,
-                            7 => 6,
-                            _ => 0,
-                        };
                         if component.quant_selector == 1 {
+                            let vlc_table = &crate::huffman::SPECTRAL_VLC[0];
                             for pair in component.mantissas.chunks(2) {
                                 let a = pair.first().copied().unwrap_or(0);
                                 let b = pair.get(1).copied().unwrap_or(0);
-                                bw.write_bits(self.selector1_clc_pair_bits(a, b), 4);
+                                let symbol = self.selector1_vlc_symbol(a, b) as usize;
+                                let entry = &vlc_table.entries[symbol];
+                                bw.write_bits(entry.code as u32, entry.len as usize);
                             }
                         } else {
+                            let vlc_table =
+                                &crate::huffman::SPECTRAL_VLC[component.quant_selector - 1];
                             for &mantissa in component.mantissas.iter().take(component.coded_values)
                             {
-                                bw.write_bits(
-                                    self.make_signed_bits(mantissa, mantissa_bits),
-                                    mantissa_bits,
-                                );
+                                let symbol = self.scalar_vlc_symbol(mantissa) as usize;
+                                let entry = &vlc_table.entries[symbol];
+                                bw.write_bits(entry.code as u32, entry.len as usize);
                             }
                         }
                     }
@@ -2696,10 +2713,6 @@ impl Atrac3Context {
             1 => 1,
             _ => 0,
         }
-    }
-
-    fn selector1_clc_pair_bits(&self, a: i16, b: i16) -> u32 {
-        (self.clc_pair_code(a) << 2) | self.clc_pair_code(b)
     }
 
     fn write_bfu_clc(&self, plan: &BfuCoding, bw: &mut crate::huffman::BitWriter) {

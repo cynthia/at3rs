@@ -143,6 +143,21 @@ This enables tightened gain-control detection only. Tonal-component coding and
 analysis-scale variants remain in the closed-loop evaluator because they are
 useful for some fixtures but regress others.
 
+The most recent full qualitative payload transcode was generated with:
+
+```sh
+python3 eval/run_eval.py fixtures --encoder-quality-only --at3rs-quality high --no-build --jobs 4 --timeout 300
+```
+
+The decoded WAVs are under:
+
+```text
+output/main@9a7de74-dirty/encoder_quality/fixtures/<fixture>/decoded/
+```
+
+Use `at3rs_sony.wav` for at3rs encoder listening, with `foss_sony.wav` and
+`sony_sony.wav` as side-by-side references.
+
 Use an explicit tools directory:
 
 ```sh
@@ -212,3 +227,22 @@ Additional fixture hygiene tests ensure WAV fixtures remain flat under `fixtures
 ## Interpreting Results
 
 SNR is useful for catching large regressions and alignment failures. ViSQOL and PEAQ are useful for trend tracking, but they do not fully describe ATRAC artifacts such as transient crackle, tonal smearing, or ringing. Keep listening comparisons alongside metric reports when evaluating encoder changes.
+
+Current encoder-quality snapshot, using Sony decode for all ATRAC3 encoders:
+
+- at3rs high preset: average SNR 13.36 dB, ViSQOL 4.374, PEAQ ODG -2.162.
+- FOSS atracdenc: average SNR 20.42 dB, ViSQOL 4.360, PEAQ ODG -2.350.
+- Sony reference: average SNR 23.36 dB, ViSQOL 4.210, PEAQ ODG -1.236.
+
+Music payloads are now generally stronger than the synthetic fixtures by PEAQ:
+`billiejean_30s`, `iwish_30s`, `magnetic_30s`, `secretgarden_30s`, and
+`walkmehome_30s` all score better than -2.0 ODG for `at3rs -> sony`. The main
+remaining metric weakness is synthetic tonal content: the log sweeps and
+`test.wav` still score poorly by PEAQ despite high ViSQOL.
+
+Tonal-component coding remains experimental. The bitstream path now follows the
+FOSS-style tonal VLC mode and charges the non-empty tonal header in the bit
+budget, but local experiments showed that this does not close the sweep gap.
+FOSS with tonal components disabled still performs well on the sine sweep, so
+the sweep weakness should be treated as an allocation/quantization problem
+rather than primarily a tonal-component syntax problem.

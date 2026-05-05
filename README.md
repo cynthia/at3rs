@@ -55,9 +55,16 @@ Encode with the conservative high-quality preset:
 cargo run --release -- -e fixtures/test.wav output/test.at3 132 --quality high
 ```
 
-`--quality high` currently enables the tightened gain-control candidate path. It
-does not enable tonal-component coding or analysis-scale changes; those remain
-closed-loop evaluation candidates because they are strongly content-dependent.
+`--quality high` currently enables the tightened gain-control candidate path and
+the current conservative allocation tuning. It does not enable tonal-component
+coding or analysis-scale changes; those remain explicit experimental flags
+because they are strongly content-dependent.
+
+`--enable-tonal-components` writes experimental ATRAC3 tonal-component syntax.
+The syntax path is aligned with the FOSS encoder's VLC tonal coding mode, but it
+is not a quality win today. In particular, sine-sweep tests show that the
+remaining tonal/synthetic weakness is more likely in allocation or quantization
+than in tonal-component syntax itself.
 
 Run the encoder/decoder comparison matrix for every WAV in `fixtures/`:
 
